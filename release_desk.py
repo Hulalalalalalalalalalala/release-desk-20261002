@@ -17,7 +17,7 @@ class ReleaseDesk:
         self.path = Path(path)
 
     def releases(self):
-        return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        return self._read_store()
 
     def add(self, version, changes):
         if not re.fullmatch(VERSION_PATTERN, version):
@@ -132,8 +132,6 @@ class ReleaseDesk:
             if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
                 raise ValueError("version must have three nonnegative numeric components")
         records = self.releases()
-        if not isinstance(records, dict):
-            raise ValueError("release store must be a JSON object")
         base = self._checked_entries(records, base_version)
         target = self._checked_entries(records, target_version)
         added, removed, unchanged = [], [], []
