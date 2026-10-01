@@ -124,6 +124,114 @@ class ReleaseDeskTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stdout))
 
+    def test_import_new_versions_sorted(self):
+        payload = {
+            "1.10.0": [{"category": "Added", "text": "Bigger"}],
+            "0.9.0": [{"category": "Fixed", "text": "Earlier", "note": "ignored"}],
+            "1.2.0": [{"category": "Changed", "text": " Mid "}],
+        }
+        result = self.desk.import_releases(payload)
+        self.assertEqual(result, {"imported": ["0.9.0", "1.2.0", "1.10.0"], "skipped": []})
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["1.2.0"], [{"category": "Changed", "text": "Mid"}])
+        self.assertEqual(set(stored["0.9.0"][0]), {"category", "text"})
+        self.assertEqual(self.desk.versions(), ["0.9.0", "1.2.0", "1.10.0"])
+
+    def test_import_empty_payload_creates_nothing(self):
+        self.assertEqual(self.desk.import_releases({}), {"imported": [], "skipped": []})
+        self.assertFalse(self.path.exists())
+
+    def test_import_skips_identical_and_preserves_bytes(self):
+        self.path.write_bytes(b'{"1.0.0": [{"category": "Added", "text": "Keep whitespace", "extra": 1}]}\n')
+        before = self.path.read_bytes()
+        result = self.desk.import_releases({"1.0.0": [{"category": "Added", "text": "  Keep whitespace  "}]})
+        self.assertEqual(result, {"imported": [], "skipped": ["1.0.0"]})
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_import_mixed_skip_and_import(self):
+        self.desk.add("2.0.0", [{"category": "Added", "text": "Two"}])
+        result = self.desk.import_releases({
+            "3.0.0": [{"category": "Fixed", "text": "Three"}],
+            "2.0.0": [{"category": "Added", "text": "Two"}],
+            "1.0.0": [{"category": "Changed", "text": "One"}, {"category": "Changed", "text": "One"}],
+        })
+        self.assertEqual(result, {"imported": ["1.0.0", "3.0.0"], "skipped": ["2.0.0"]})
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["2.0.0"], [{"category": "Added", "text": "Two"}])
+        self.assertEqual(len(stored["1.0.0"]), 2)
+
+    def test_import_conflicts_leave_no_partial_result(self):
+        original = b'{"1.0.0": [{"category": "Added", "text": "Same"}, {"category": "Fixed", "text": "Other"}]}\n'
+        self.path.write_bytes(original)
+        payloads = (
+            {"1.0.0": [{"category": "Added", "text": "Different"}], "2.0.0": [{"category": "Added", "text": "New"}]},
+            {"1.0.0": [{"category": "Fixed", "text": "Other"}, {"category": "Added", "text": "Same"}]},
+            {"1.0.0": [{"category": "Added", "text": "Same"}]},
+            {"1.0.0": [{"category": "Added", "text": "same"}], "2.0.0": [{"category": "Added", "text": "New"}]},
+        )
+        for payload in payloads:
+            with self.assertRaises(ValueError):
+                self.desk.import_releases(payload)
+            self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(self.desk.versions(), ["1.0.0"])
+
+    def test_import_invalid_payloads_change_nothing(self):
+        bad_payloads = (
+            [],
+            {"v1.0.0": [{"category": "Added", "text": "x"}]},
+            {"1.0": [{"category": "Added", "text": "x"}]},
+            {"1.0.0": []},
+            {"1.0.0": "nope"},
+            {"1.0.0": [{"category": "Other", "text": "x"}]},
+            {"1.0.0": [{"category": "Added", "text": "  "}]},
+            {"1.0.0": [{"category": "Added", "text": "a\nb"}]},
+            {"1.0.0": [{"text": "x"}]},
+            {"1.0.0": [42]},
+        )
+        for payload in bad_payloads:
+            with self.assertRaises(ValueError):
+                self.desk.import_releases(payload)
+            self.assertFalse(self.path.exists())
+
+    def test_import_invalid_target_store(self):
+        bad_stores = (b"\xff\xfe", b"[1, 2]", b'{"v1": []}',
+                      b'{"1.0.0": []}', b'{"1.0.0": [{"category": "Nope", "text": "x"}]}')
+        payload = {"2.0.0": [{"category": "Added", "text": "New"}]}
+        for content in bad_stores:
+            self.path.write_bytes(content)
+            with self.assertRaises(ValueError):
+                self.desk.import_releases(payload)
+            self.assertEqual(self.path.read_bytes(), content)
+
+    def test_import_unicode_and_duplicates(self):
+        result = self.desk.import_releases({"1.0.0": [
+            {"category": "Added", "text": "café ☃"},
+            {"category": "Fixed", "text": "Repeat"},
+            {"category": "Fixed", "text": "Repeat"},
+        ]})
+        self.assertEqual(result["imported"], ["1.0.0"])
+        self.assertEqual(self.desk.notes("1.0.0"), "# 1.0.0\n\n## Added\n- café ☃\n\n## Fixed\n- Repeat\n- Repeat\n")
+
+    def test_cli_import(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        source = Path(self.temp.name) / "incoming.json"
+        source.write_text(json.dumps({
+            "1.10.0": [{"category": "Added", "text": "Ten"}],
+            "1.2.0": [{"category": "Fixed", "text": "Two"}],
+        }), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", str(source)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"imported": ["1.2.0", "1.10.0"], "skipped": []})
+        again = subprocess.run(prefix + ["import", str(source)], capture_output=True, text=True)
+        self.assertEqual(json.loads(again.stdout), {"imported": [], "skipped": ["1.2.0", "1.10.0"]})
+        source.write_bytes(b"\xff\xfe")
+        bad_encoding = subprocess.run(prefix + ["import", str(source)], capture_output=True, text=True)
+        self.assertEqual(bad_encoding.returncode, 2)
+        self.assertIn("error", json.loads(bad_encoding.stdout))
+        missing = subprocess.run(prefix + ["import", str(Path(self.temp.name) / "missing.json")], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+
 
 if __name__ == "__main__":
     unittest.main()
