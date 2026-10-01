@@ -1,0 +1,12 @@
+Install
+python3 --version
+Python 3.10 or newer; standard library only.
+
+Start
+python3 release_desk.py notes 1.1.0
+Prints release notes containing Added and Fixed sections.
+
+Smoke Test
+python3 release_desk.py versions
+Prints versions 1.0.0 and 1.1.0 in numeric order.
+python3 -B -m unittest -v
