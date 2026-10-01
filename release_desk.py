@@ -1,7 +1,9 @@
 """Store releases and render change notes grouped by category."""
 import argparse
 import json
+import os
 import re
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -35,6 +37,81 @@ class ReleaseDesk:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return {"version": version, "changes": len(clean)}
+
+    def import_releases(self, payload):
+        incoming = self._validated_payload(payload)
+        records = self._read_store()
+        imported, skipped = [], []
+        for version, changes in incoming.items():
+            if version in records:
+                if self._clean_changes(records[version]) != changes:
+                    raise ValueError("conflicting release already exists")
+                skipped.append(version)
+            else:
+                records[version] = changes
+                imported.append(version)
+        order = lambda version: tuple(map(int, version.split(".")))
+        imported.sort(key=order)
+        skipped.sort(key=order)
+        if imported:
+            self._write_store(records)
+        return {"imported": imported, "skipped": skipped}
+
+    @staticmethod
+    def _clean_changes(changes):
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("at least one change is required")
+        clean = []
+        for change in changes:
+            if not isinstance(change, dict):
+                raise ValueError("changes require a valid category and single-line text")
+            category, text = change.get("category"), change.get("text")
+            if category not in CATEGORIES or not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
+                raise ValueError("changes require a valid category and single-line text")
+            clean.append({"category": category, "text": text.strip()})
+        return clean
+
+    def _validated_payload(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("import payload must be a JSON object")
+        normalized = {}
+        for version, changes in payload.items():
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+            normalized[version] = self._clean_changes(changes)
+        return normalized
+
+    def _read_store(self):
+        if not self.path.exists():
+            return {}
+        try:
+            records = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("release store must be a JSON object") from exc
+        if not isinstance(records, dict):
+            raise ValueError("release store must be a JSON object")
+        for version, changes in records.items():
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+            self._clean_changes(changes)
+        return records
+
+    def _write_store(self, records):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
+        temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False)
+        try:
+            temp.write(content)
+            temp.flush()
+            os.fsync(temp.fileno())
+            temp.close()
+            os.replace(temp.name, self.path)
+        except OSError:
+            try:
+                os.unlink(temp.name)
+            except OSError:
+                pass
+            raise
 
     def versions(self):
         return sorted(self.releases(), key=lambda version: tuple(map(int, version.split("."))))
@@ -106,6 +183,7 @@ def main():
     add.add_argument("changes")
     commands.add_parser("notes").add_argument("version")
     commands.add_parser("versions")
+    commands.add_parser("import").add_argument("file")
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
@@ -117,6 +195,12 @@ def main():
         else:
             if args.command == "add":
                 result = desk.add(args.version, json.loads(Path(args.changes).read_text(encoding="utf-8")))
+            elif args.command == "import":
+                try:
+                    payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("import file must contain UTF-8 encoded JSON") from exc
+                result = desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
             else:
