@@ -17,25 +17,17 @@ class ReleaseDesk:
         self.path = Path(path)
 
     def releases(self):
-        return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        return self._read_store()
 
     def add(self, version, changes):
         if not re.fullmatch(VERSION_PATTERN, version):
             raise ValueError("version must have three nonnegative numeric components")
-        records = self.releases()
+        records = self._read_store()
         if version in records:
             raise ValueError("release already exists")
-        if not isinstance(changes, list) or not changes:
-            raise ValueError("at least one change is required")
-        clean = []
-        for change in changes:
-            category, text = change["category"], change["text"]
-            if category not in CATEGORIES or not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
-                raise ValueError("changes require a valid category and single-line text")
-            clean.append({"category": category, "text": text.strip()})
+        clean = self._clean_changes(changes)
         records[version] = clean
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write_store(records)
         return {"version": version, "changes": len(clean)}
 
     def import_releases(self, payload):
@@ -84,16 +76,25 @@ class ReleaseDesk:
     def _read_store(self):
         if not self.path.exists():
             return {}
+        # OSErrors (directory target, permissions, ...) propagate unchanged.
+        raw = self.path.read_text(encoding="utf-8")
+        if not raw:
+            raise ValueError("release store must be a JSON object")
         try:
-            records = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            records = json.loads(raw)
+        except json.JSONDecodeError as exc:
             raise ValueError("release store must be a JSON object") from exc
+        return self._validated_records(records)
+
+    @staticmethod
+    def _validated_records(records):
         if not isinstance(records, dict):
             raise ValueError("release store must be a JSON object")
         for version, changes in records.items():
             if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
                 raise ValueError("version must have three nonnegative numeric components")
-            self._clean_changes(changes)
+            # Validates without replacing: whitespace, extra fields and order survive.
+            ReleaseDesk._clean_changes(changes)
         return records
 
     def _write_store(self, records):
@@ -114,10 +115,11 @@ class ReleaseDesk:
             raise
 
     def versions(self):
-        return sorted(self.releases(), key=lambda version: tuple(map(int, version.split("."))))
+        records = self._read_store()
+        return sorted(records, key=lambda version: tuple(map(int, version.split("."))))
 
     def notes(self, version):
-        records = self.releases()
+        records = self._read_store()
         if version not in records:
             raise ValueError("unknown release")
         lines = [f"# {version}"]
@@ -131,9 +133,7 @@ class ReleaseDesk:
         for version in (base_version, target_version):
             if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
                 raise ValueError("version must have three nonnegative numeric components")
-        records = self.releases()
-        if not isinstance(records, dict):
-            raise ValueError("release store must be a JSON object")
+        records = self._read_store()
         base = self._checked_entries(records, base_version)
         target = self._checked_entries(records, target_version)
         added, removed, unchanged = [], [], []
@@ -160,18 +160,7 @@ class ReleaseDesk:
     def _checked_entries(records, version):
         if version not in records:
             raise ValueError("unknown release")
-        changes = records[version]
-        if not isinstance(changes, list) or not changes:
-            raise ValueError("release must contain at least one change")
-        clean = []
-        for change in changes:
-            if not isinstance(change, dict):
-                raise ValueError("changes require a valid category and single-line text")
-            category, text = change.get("category"), change.get("text")
-            if category not in CATEGORIES or not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
-                raise ValueError("changes require a valid category and single-line text")
-            clean.append({"category": category, "text": text.strip()})
-        return clean
+        return ReleaseDesk._clean_changes(records[version])
 
 
 def main():
@@ -208,7 +197,7 @@ def main():
             print(json.dumps(result, ensure_ascii=False))
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(json.dumps({"error": str(exc)}))
+        print(json.dumps({"error": str(exc) or exc.__class__.__name__}))
         return 2
 
 
