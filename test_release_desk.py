@@ -892,5 +892,230 @@ class ChecklistTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
 
+class MakeChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Retry empty exports"}])
+
+    def template(self, **overrides):
+        data = {
+            "items": [
+                {"id": "docs", "text": " Write notes ", "required": True},
+                {"id": "fix", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+                {"id": "feat", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_filters_by_release_categories_and_keeps_order(self):
+        result = self.desk.generate_checklist("1.2.0", self.template())
+        self.assertEqual(set(result), {"version", "items"})
+        self.assertEqual(result, {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "fix", "text": "Verify fix", "required": True, "status": "pending"},
+        ]})
+
+    def test_multi_category_item_and_single_occurrence(self):
+        self.desk.add("2.0.0", [
+            {"category": "Added", "text": "One"},
+            {"category": "Added", "text": "Two"},
+            {"category": "Fixed", "text": "Three"},
+        ])
+        template = {"items": [
+            {"id": "both", "text": "Both", "required": True, "categories": ["Added", "Fixed"]},
+        ]}
+        result = self.desk.generate_checklist("2.0.0", template)
+        self.assertEqual([item["id"] for item in result["items"]], ["both"])
+
+    def test_template_status_and_extra_fields_ignored(self):
+        template = {"extra": 1, "items": [
+            {"id": "a", "text": "A", "required": True, "status": "done", "other": [1]},
+        ]}
+        result = self.desk.generate_checklist("1.2.0", template)
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "A", "required": True, "status": "pending"}])
+
+    def test_result_feeds_existing_checklist(self):
+        result = self.desk.generate_checklist("1.2.0", self.template())
+        report = self.desk.checklist("1.2.0", result)
+        self.assertEqual(set(report), {"version", "ready", "done", "pending", "blocked"})
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["pending"]], ["docs", "fix"])
+
+    def test_invalid_items_rejected_even_when_not_matching(self):
+        # The Added-only item would be filtered out, but is still validated.
+        bad = {"id": "feat", "text": "x\ny", "required": True, "categories": ["Added"]}
+        template = self.template()
+        template["items"][2] = bad
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", template)
+
+    def test_invalid_template_structures(self):
+        good = {"id": "a", "text": "A", "required": True}
+        invalid = [
+            None, [], "x", 1, {},
+            {"items": []}, {"items": {}}, {"items": None},
+            {"items": [["x"]]}, {"items": ["x"]}, {"items": [None]},
+            {"items": [{**good, "id": "  "}]},
+            {"items": [{**good, "id": "a\nb"}]},
+            {"items": [{**good, "id": 1}]},
+            {"items": [{**good, "text": ""}]},
+            {"items": [{**good, "text": "a\rb"}]},
+            {"items": [{**good, "required": 1}]},
+            {"items": [{**good, "required": "yes"}]},
+            {"items": [{**good, "categories": []}]},
+            {"items": [{**good, "categories": "Added"}]},
+            {"items": [{**good, "categories": ["added"]}]},
+            {"items": [{**good, "categories": ["Other"]}]},
+            {"items": [{**good, "categories": [1]}]},
+            {"items": [{**good, "categories": ["Added", "Added"]}]},
+            {"items": [{**good, "categories": ["Fixed", "Added", "Fixed"]}]},
+            {"items": [good, {**good, "id": " a "}]},
+            {"items": [good, {**good, "id": "A", "text": "B"}, {**good}]},
+        ]
+        for template in invalid:
+            with self.assertRaises(ValueError, msg=repr(template)):
+                self.desk.generate_checklist("1.2.0", template)
+
+    def test_categories_may_omit_or_cover_all(self):
+        template = {"items": [
+            {"id": "any", "text": "Any", "required": True},
+            {"id": "all", "text": "All", "required": False,
+             "categories": ["Added", "Changed", "Fixed"]},
+        ]}
+        result = self.desk.generate_checklist("1.2.0", template)
+        self.assertEqual([item["id"] for item in result["items"]], ["any", "all"])
+
+    def test_ids_case_sensitive_without_unicode_normalization(self):
+        template = {"items": [
+            {"id": "Same", "text": "One", "required": True},
+            {"id": "same", "text": "Two", "required": False},
+            {"id": "caf" + chr(0x00E9), "text": "Composed", "required": False},
+            {"id": "caf" + "e" + chr(0x0301), "text": "Decomposed", "required": False},
+        ]}
+        result = self.desk.generate_checklist("1.2.0", template)
+        self.assertEqual(len(result["items"]), 4)
+
+    def test_empty_after_filter_and_no_required_rejected(self):
+        only_added = {"items": [
+            {"id": "feat", "text": "Feature", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", only_added)
+        no_required = {"items": [
+            {"id": "opt", "text": "Optional", "required": False},
+            {"id": "fix", "text": "Fix", "required": False, "categories": ["Fixed"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", no_required)
+        # A required item that is filtered out does not count.
+        required_filtered = {"items": [
+            {"id": "opt", "text": "Optional", "required": False},
+            {"id": "feat", "text": "Feature", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", required_filtered)
+
+    def test_invalid_and_unknown_version(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.generate_checklist(version, self.template())
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("9.9.9", self.template())
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.generate_checklist("1.2.0", self.template())
+        self.assertFalse((Path(self.temp.name) / "no-dir").exists())
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", self.template())
+        self.assertEqual(self.path.read_bytes(), raw)
+        raw = b'{"1.2.0": [], "1.2.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.generate_checklist("1.2.0", self.template())
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.generate_checklist("1.2.0", self.template())
+
+    def test_readonly_and_inputs_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        template = self.template()
+        snapshot = json.loads(json.dumps(template))
+        self.desk.generate_checklist("1.2.0", template)
+        self.assertEqual(template, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_make_checklist(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        template = Path(self.temp.name) / "template.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        result = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "fix", "text": "Verify fix", "required": True, "status": "pending"},
+        ]})
+        # The generated checklist can be checked directly.
+        generated = Path(self.temp.name) / "generated.json"
+        generated.write_text(result.stdout, encoding="utf-8")
+        checked = subprocess.run(prefix + ["check", "1.2.0", str(generated)],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertFalse(json.loads(checked.stdout)["ready"])
+
+    def test_cli_make_checklist_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        template = Path(self.temp.name) / "template.json"
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            "[]",
+            '{"items": []}',
+            '{"items": [{"id": "a", "text": "A", "required": True, "categories": []}]}',
+            '{"items": [{"id": "a", "text": "A", "required": true, "required": true}]}',
+            '{"items": [{"id": "a", "text": "A", "required": true}], "items": []}',
+            json.dumps({"items": [
+                {"id": "feat", "text": "Feature", "required": True, "categories": ["Added"]}]}),
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                template.write_bytes(case)
+            else:
+                template.write_text(case, encoding="utf-8")
+            result = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+            self.assertEqual(result.stdout.count("\n"), 1)
+        unknown = subprocess.run(prefix + ["make-checklist", "9.9.9", str(template)],
+                                 capture_output=True, text=True)
+        self.assertEqual(unknown.returncode, 2)
+        absent = subprocess.run(prefix + ["make-checklist", "1.2.0", str(Path(self.temp.name) / "nope.json")],
+                                capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty, then fails as unknown release,
+        # and neither the store nor its parent directories are created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "make-checklist", "1.2.0", str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
