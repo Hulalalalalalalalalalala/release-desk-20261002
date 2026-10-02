@@ -11,6 +11,25 @@ CATEGORIES = ("Added", "Changed", "Fixed")
 
 VERSION_PATTERN = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
 
+DUPLICATE_KEY_MESSAGE = "duplicate JSON object key"
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        # Keys arrive JSON-decoded: comparison is exact and case-sensitive,
+        # with no whitespace trimming or Unicode normalization.
+        if key in result:
+            raise ValueError(DUPLICATE_KEY_MESSAGE)
+        result[key] = value
+    return result
+
+
+def _loads_json(raw):
+    # The hook runs for every object in the document, so duplicate keys are
+    # rejected anywhere, even in entries that later validation would ignore.
+    return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+
 
 class ReleaseDesk:
     def __init__(self, path):
@@ -81,7 +100,7 @@ class ReleaseDesk:
         if not raw:
             raise ValueError("release store must be a JSON object")
         try:
-            records = json.loads(raw)
+            records = _loads_json(raw)
         except json.JSONDecodeError as exc:
             raise ValueError("release store must be a JSON object") from exc
         return self._validated_records(records)
@@ -183,10 +202,10 @@ def main():
             print(desk.notes(args.version), end="")
         else:
             if args.command == "add":
-                result = desk.add(args.version, json.loads(Path(args.changes).read_text(encoding="utf-8")))
+                result = desk.add(args.version, _loads_json(Path(args.changes).read_text(encoding="utf-8")))
             elif args.command == "import":
                 try:
-                    payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                    payload = _loads_json(Path(args.file).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("import file must contain UTF-8 encoded JSON") from exc
                 result = desk.import_releases(payload)

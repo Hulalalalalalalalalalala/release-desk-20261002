@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from release_desk import ReleaseDesk
+from release_desk import ReleaseDesk, _loads_json
 
 ROOT = Path(__file__).resolve().parent
 
@@ -264,6 +264,125 @@ class ReleaseDeskTests(unittest.TestCase):
         missing = subprocess.run(prefix + ["import", str(Path(self.temp.name) / "nope.json")], capture_output=True, text=True)
         self.assertEqual(missing.returncode, 2)
         self.assertIn("error", json.loads(missing.stdout))
+
+
+    def test_store_rejects_duplicate_keys_everywhere(self):
+        change = '{"category":"Added","text":"One"}'
+        cases = {
+            "duplicate version keys, even with identical values":
+                ('{"1.0.0":[' + change + '],"1.0.0":[' + change + ']}').encode(),
+            "duplicate keys inside a change object":
+                b'{"1.0.0":[{"category":"Added","text":"One","text":"Two"}]}',
+            "duplicate keys in an ignored extra field":
+                b'{"9.9.9":[{"category":"Added","text":"One","note":"a","note":"b"}]}',
+        }
+        for label, raw in cases.items():
+            with self.subTest(label):
+                self.path.write_bytes(raw)
+                for action in (
+                    lambda: self.desk.releases(),
+                    lambda: self.desk.versions(),
+                    lambda: self.desk.notes("1.0.0"),
+                    lambda: self.desk.diff("1.0.0", "1.0.0"),
+                    lambda: self.desk.add("2.0.0", [{"category": "Added", "text": "x"}]),
+                    lambda: self.desk.import_releases({"2.0.0": [{"category": "Added", "text": "x"}]}),
+                ):
+                    with self.assertRaisesRegex(ValueError, "^duplicate JSON object key$"):
+                        action()
+                self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_duplicate_key_matching_is_exact_and_scoped(self):
+        valid = [
+            b'{"Text":"x","text":"y","category":"Added"}',
+            b'{"1.0.0":[{"category":"Added","text":"x","meta":{"text":"nested"}}]}',
+            b'[{"category":"Added","text":"the \\"text\\" field \\\\ looks like \\"category\\""}]',
+        ]
+        invalid = [
+            b'{"1.0.0":[{"category":"Added","text":"x","te\\u0078t":"y"}]}',
+            b'[{"category":"Added","category":"Fixed","text":"x"}]',
+        ]
+        for raw in valid:
+            self.assertTrue(_loads_json(raw.decode("utf-8")) is not None)
+        for raw in invalid:
+            with self.assertRaisesRegex(ValueError, "^duplicate JSON object key$"):
+                _loads_json(raw.decode("utf-8"))
+
+    def test_identical_duplicate_records_still_legal(self):
+        changes = [
+            {"category": "Fixed", "text": "Retry"},
+            {"category": "Fixed", "text": "Retry"},
+        ]
+        result = self.desk.add("1.0.0", changes)
+        self.assertEqual(result["changes"], 2)
+        self.assertEqual(len(self.desk.releases()["1.0.0"]), 2)
+
+    def test_in_memory_objects_keep_existing_rules(self):
+        self.assertEqual(self.desk.add("1.0.0", [{"category": "Added", "text": " x"}])["changes"], 1)
+        self.assertEqual(self.desk.import_releases({"1.0.0": [{"category": "Added", "text": "x"}]})["skipped"], ["1.0.0"])
+
+    def test_cli_add_rejects_duplicate_keys_without_creating_store(self):
+        nested = Path(self.temp.name) / "state" / "releases.json"
+        candidate = Path(self.temp.name) / "changes.json"
+        candidate.write_text(
+            '[{"category":"Added","text":"One","text":"Two"}]', encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(nested),
+             "add", "1.0.0", str(candidate)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, json.dumps({"error": "duplicate JSON object key"}) + "\n")
+        self.assertEqual(failed.stderr, "")
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_cli_add_rejects_duplicate_keys_via_unicode_escape(self):
+        candidate = Path(self.temp.name) / "changes.json"
+        candidate.write_text(
+            '[{"category":"Added","text":"One","te\\u0078t":"Two"}]', encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+             "add", "1.0.0", str(candidate)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertFalse(self.path.exists())
+
+    def test_cli_import_rejects_duplicate_batch_keys(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        batch = Path(self.temp.name) / "batch.json"
+        batch.write_text(
+            '{"2.0.0":[{"category":"Added","text":"New"}],'
+            '"3.0.0":[{"category":"Fixed","text":"Patch","note":"a","note":"b"}]}',
+            encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+             "import", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_cli_import_duplicate_keys_creates_nothing(self):
+        missing = Path(self.temp.name) / "nested" / "store.json"
+        batch = Path(self.temp.name) / "batch.json"
+        batch.write_text(
+            '{"1.0.0":[{"category":"Added","text":"One"}],"1.0.0":[{"category":"Fixed","text":"Two"}]}',
+            encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(missing),
+             "import", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+
+    def test_cli_read_entrypoints_reject_duplicate_store_keys(self):
+        self.path.write_bytes(
+            b'{"1.0.0":[{"category":"Added","text":"One"}],'
+            b'"9.9.9":[{"category":"Added","text":"Ignored","x":1,"x":2}]}')
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        for args in (["versions"], ["notes", "1.0.0"], ["diff", "1.0.0", "1.0.0"]):
+            failed = subprocess.run(prefix + args, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, args)
+            self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
 
 
 if __name__ == "__main__":
