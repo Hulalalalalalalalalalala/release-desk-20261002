@@ -274,6 +274,24 @@ def _atomic_write(path, content):
         raise
 
 
+def _atomic_write_new(path, content):
+    # Like _atomic_write but never creates missing parent directories: a
+    # missing parent raises OSError and no file or directory is left behind.
+    temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    try:
+        temp.write(content)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temp.close()
+        os.replace(temp.name, path)
+    except OSError:
+        try:
+            os.unlink(temp.name)
+        except OSError:
+            pass
+        raise
+
+
 def _same_file(path_a, path_b):
     # Existing files: compare via inode so symlinks and hard links are caught.
     try:
@@ -619,6 +637,52 @@ class ReleaseDesk:
         ready = all(item["status"] == "done" for item in resulting if item["required"])
         return {"version": version, "changed": changed, "items": resulting,
                 "updated": updated, "ready": ready}
+
+    def release_record(self, version, checklist, template, rollback):
+        # Read-only release record snapshot: the release's exported changes,
+        # its rendered notes and the full audit report, frozen together with a
+        # rollback description. The audit follows audit_checklist unchanged;
+        # a report that is not ready rejects the record.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        audit = self.audit_checklist(version, checklist, template)
+        if not audit["ready"]:
+            raise ValueError("release checklist is not ready")
+        # The store was fully validated by the audit; read it again read-only.
+        records = self._read_store()
+        changes = [
+            {"category": change["category"], "text": change["text"].strip()}
+            for change in records[version]
+        ]
+        rollback_record = self._validated_rollback(rollback, version, records)
+        return {"version": version, "changes": changes, "notes": self.notes(version),
+                "audit": audit, "rollback": rollback_record}
+
+    @staticmethod
+    def _validated_rollback(rollback, version, records):
+        # Validate the rollback description: exactly targetVersion and steps.
+        # targetVersion is null or a registered version numerically lower than
+        # the release; steps is a non-empty array of single-line strings,
+        # trimmed like checklist texts, keeping order and duplicates.
+        if not isinstance(rollback, dict) or set(rollback) != {"targetVersion", "steps"}:
+            raise ValueError("rollback requires exactly targetVersion and steps")
+        target = rollback["targetVersion"]
+        if target is not None:
+            if not isinstance(target, str) or not re.fullmatch(VERSION_PATTERN, target):
+                raise ValueError("rollback target version must be null or a valid version")
+            if target not in records:
+                raise ValueError("rollback target version must be a registered release")
+            if _version_order(target) >= _version_order(version):
+                raise ValueError("rollback target version must be lower than the release version")
+        steps = rollback["steps"]
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("rollback steps must be a non-empty array of strings")
+        clean_steps = []
+        for step in steps:
+            if not isinstance(step, str) or not step.strip() or "\n" in step or "\r" in step:
+                raise ValueError("rollback steps must be non-empty single-line strings")
+            clean_steps.append(step.strip())
+        return {"targetVersion": target, "steps": clean_steps}
 
     @staticmethod
     def _validated_updates(updates):
@@ -1053,6 +1117,12 @@ def main():
     update_checklist.add_argument("version")
     update_checklist.add_argument("updates")
     update_checklist.add_argument("checklist")
+    record_release = commands.add_parser("record-release")
+    record_release.add_argument("version")
+    record_release.add_argument("checklist")
+    record_release.add_argument("template")
+    record_release.add_argument("rollback")
+    record_release.add_argument("--output")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1196,6 +1266,32 @@ def main():
                     raise ValueError(
                         "checklist file must not be the same file as the updates file")
                 result = desk.update_checklist(args.version, updates_payload, checklist_path)
+            elif args.command == "record-release":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                try:
+                    rollback_payload = _loads_unique(Path(args.rollback).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("rollback file must contain UTF-8 encoded JSON") from exc
+                result = desk.release_record(args.version, checklist_payload,
+                                             template_payload, rollback_payload)
+                if args.output:
+                    output_path = Path(args.output)
+                    if output_path.exists() or output_path.is_symlink():
+                        raise ValueError("output file already exists")
+                    for other in (desk.path, Path(args.checklist),
+                                  Path(args.template), Path(args.rollback)):
+                        if _same_file(other, output_path):
+                            raise ValueError(
+                                "output file must not be the same file as the store or an input file")
+                    content = json.dumps(result, ensure_ascii=False) + "\n"
+                    _atomic_write_new(output_path, content)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:

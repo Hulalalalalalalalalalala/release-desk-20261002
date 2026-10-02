@@ -3735,5 +3735,253 @@ class UpdateChecklistTests(unittest.TestCase):
         self.assertEqual(self.checklist.read_bytes(), before)
 
 
+class ReleaseRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [{"category": "Added", "text": "First release"}])
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": " Retry empty exports "},
+                                {"category": "Fixed", "text": "Retry empty exports"},
+                                {"category": "Added", "text": "Export receipts"}])
+
+    def template(self, **overrides):
+        data = {"items": [
+            {"id": "docs", "text": " Write notes ", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+        ]}
+        data.update(overrides)
+        return data
+
+    def checklist(self, **overrides):
+        data = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+        ]}
+        data.update(overrides)
+        return data
+
+    def rollback(self, **overrides):
+        data = {"targetVersion": "1.0.0",
+                "steps": [" Stop the service ", "Restore backup", "Restore backup"]}
+        data.update(overrides)
+        return data
+
+    def write_inputs(self, checklist=None, template=None, rollback=None):
+        checklist_file = Path(self.temp.name) / "checklist.json"
+        template_file = Path(self.temp.name) / "template.json"
+        rollback_file = Path(self.temp.name) / "rollback.json"
+        checklist_file.write_text(json.dumps(checklist or self.checklist()), encoding="utf-8")
+        template_file.write_text(json.dumps(template or self.template()), encoding="utf-8")
+        rollback_file.write_text(json.dumps(rollback or self.rollback()), encoding="utf-8")
+        return checklist_file, template_file, rollback_file
+
+    def command(self, *arguments):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "record-release", *arguments]
+
+    def test_record_shape_and_content(self):
+        record = self.desk.release_record("1.2.0", self.checklist(), self.template(), self.rollback())
+        self.assertEqual(set(record), {"version", "changes", "notes", "audit", "rollback"})
+        self.assertEqual(record["version"], "1.2.0")
+        # Export semantics: only category and trimmed text, order and duplicates kept.
+        self.assertEqual(record["changes"], [
+            {"category": "Fixed", "text": "Retry empty exports"},
+            {"category": "Fixed", "text": "Retry empty exports"},
+            {"category": "Added", "text": "Export receipts"}])
+        self.assertEqual(record["notes"], self.desk.notes("1.2.0"))
+        self.assertEqual(record["audit"],
+                         self.desk.audit_checklist("1.2.0", self.checklist(), self.template()))
+        self.assertTrue(record["audit"]["ready"])
+        self.assertEqual(record["rollback"], {
+            "targetVersion": "1.0.0",
+            "steps": ["Stop the service", "Restore backup", "Restore backup"]})
+
+    def test_deterministic_and_null_target(self):
+        rollback = {"targetVersion": None, "steps": ["Restore backup"]}
+        first = self.desk.release_record("1.2.0", self.checklist(), self.template(), rollback)
+        second = self.desk.release_record("1.2.0", self.checklist(), self.template(), rollback)
+        self.assertEqual(first, second)
+        self.assertEqual(first["rollback"], {"targetVersion": None, "steps": ["Restore backup"]})
+
+    def test_not_ready_rejected_and_state_unchanged(self):
+        checklist = self.checklist()
+        checklist["items"][0]["status"] = "pending"
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        with self.assertRaises(ValueError):
+            self.desk.release_record("1.2.0", checklist, self.template(), self.rollback())
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        # An optional mismatch alone never blocks the record.
+        checklist = self.checklist()
+        checklist["items"][2]["text"] = "Announce the feature"
+        record = self.desk.release_record("1.2.0", checklist, self.template(), self.rollback())
+        self.assertTrue(record["audit"]["ready"])
+
+    def test_rollback_field_set(self):
+        for rollback in ({"targetVersion": "1.0.0"},
+                         {"steps": ["a"]},
+                         {"targetVersion": "1.0.0", "steps": ["a"], "extra": 1},
+                         ["targetVersion", "steps"],
+                         None):
+            with self.assertRaises(ValueError):
+                self.desk.release_record("1.2.0", self.checklist(), self.template(), rollback)
+
+    def test_rollback_target_version(self):
+        for target in ("v1", "1.0", "01.0.0", 1, True, "9.9.9", "1.2.0", "1.3.0", "2.0.0"):
+            with self.assertRaises(ValueError, msg=repr(target)):
+                self.desk.release_record("1.2.0", self.checklist(), self.template(),
+                                         self.rollback(targetVersion=target))
+        # Any registered lower version is accepted.
+        record = self.desk.release_record("1.2.0", self.checklist(), self.template(),
+                                          self.rollback(targetVersion="1.0.0"))
+        self.assertEqual(record["rollback"]["targetVersion"], "1.0.0")
+
+    def test_rollback_steps(self):
+        for steps in ([], "Restore backup", ["  "], ["a", ""], ["a\nb"], ["a\rb"], [1], [None], [{}]):
+            with self.assertRaises(ValueError, msg=repr(steps)):
+                self.desk.release_record("1.2.0", self.checklist(), self.template(),
+                                         self.rollback(steps=steps))
+
+    def test_invalid_version_checklist_template_and_store(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0", "9.9.9"):
+            with self.assertRaises(ValueError):
+                self.desk.release_record(version, self.checklist(), self.template(), self.rollback())
+        with self.assertRaises(ValueError):
+            self.desk.release_record("1.2.0", self.checklist(version="1.3.0"),
+                                     self.template(), self.rollback())
+        with self.assertRaises(ValueError):
+            self.desk.release_record("1.2.0", self.checklist(), {"items": []}, self.rollback())
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.release_record("1.2.0", self.checklist(), self.template(), self.rollback())
+        self.assertEqual(self.path.read_bytes(), raw)
+        # A missing store is treated as empty and then reports the version as unknown.
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.release_record("1.2.0", self.checklist(), self.template(), self.rollback())
+        self.assertFalse(missing.path.parent.exists())
+
+    def test_inputs_untouched_and_result_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist, template, rollback = self.checklist(), self.template(), self.rollback()
+        snapshot = json.loads(json.dumps(
+            {"checklist": checklist, "template": template, "rollback": rollback}))
+        record = self.desk.release_record("1.2.0", checklist, template, rollback)
+        record["changes"].append({"category": "Added", "text": "Extra"})
+        record["audit"]["done"].clear()
+        record["rollback"]["steps"].append("Extra")
+        self.assertEqual({"checklist": checklist, "template": template, "rollback": rollback}, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_record_release(self):
+        checklist_file, template_file, rollback_file = self.write_inputs()
+        result = subprocess.run(self.command("1.2.0", str(checklist_file), str(template_file),
+                                             str(rollback_file)),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        record = json.loads(result.stdout)
+        self.assertEqual(set(record), {"version", "changes", "notes", "audit", "rollback"})
+        self.assertEqual(record["rollback"]["steps"],
+                         ["Stop the service", "Restore backup", "Restore backup"])
+        # --output saves the same record as newline-terminated UTF-8 JSON and
+        # leaves the console result unchanged.
+        output = Path(self.temp.name) / "record.json"
+        with_output = subprocess.run(self.command("1.2.0", str(checklist_file), str(template_file),
+                                                  str(rollback_file), "--output", str(output)),
+                                     capture_output=True, text=True)
+        self.assertEqual(with_output.returncode, 0, with_output.stderr)
+        self.assertEqual(with_output.stdout, result.stdout)
+        self.assertEqual(output.read_bytes(), (result.stdout.rstrip("\n") + "\n").encode("utf-8"))
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), record)
+
+    def test_cli_record_release_output_rejections(self):
+        checklist_file, template_file, rollback_file = self.write_inputs()
+        base = self.command("1.2.0", str(checklist_file), str(template_file), str(rollback_file))
+        # An existing file, a symlink, a store alias and a hard link to an input
+        # are all rejected and nothing is written.
+        existing = Path(self.temp.name) / "record.json"
+        existing.write_text("{}", encoding="utf-8")
+        link = Path(self.temp.name) / "link.json"
+        os.symlink(checklist_file, link)
+        dangling = Path(self.temp.name) / "dangling.json"
+        os.symlink(Path(self.temp.name) / "nope.json", dangling)
+        hard = Path(self.temp.name) / "hard.json"
+        os.link(template_file, hard)
+        alias = Path(self.temp.name) / ".." / Path(self.temp.name).name / "releases.json"
+        for output in (existing, link, dangling, hard, alias, self.path, checklist_file):
+            failed = subprocess.run(base + ["--output", str(output)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, output)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        self.assertEqual(existing.read_text(encoding="utf-8"), "{}")
+        # A missing parent directory fails and creates nothing.
+        nested = Path(self.temp.name) / "missing-dir" / "record.json"
+        failed = subprocess.run(base + ["--output", str(nested)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_cli_record_release_errors(self):
+        checklist_file, template_file, rollback_file = self.write_inputs()
+        before = self.path.read_bytes()
+        output = Path(self.temp.name) / "record.json"
+        base = self.command("1.2.0", str(checklist_file), str(template_file), str(rollback_file))
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            '{"targetVersion": "1.0.0", "targetVersion": "1.0.0", "steps": ["a"]}',
+            json.dumps({"targetVersion": "9.9.9", "steps": ["a"]}),
+            json.dumps({"targetVersion": None, "steps": []}),
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                rollback_file.write_bytes(case)
+            else:
+                rollback_file.write_text(case, encoding="utf-8")
+            failed = subprocess.run(base + ["--output", str(output)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, case)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+            self.assertFalse(output.exists())
+        # Not-ready checklists, bad versions and unknown versions fail the same way.
+        self.write_inputs(checklist=self.checklist(), rollback=self.rollback())
+        pending = self.checklist()
+        pending["items"][0]["status"] = "pending"
+        checklist_file.write_text(json.dumps(pending), encoding="utf-8")
+        failed = subprocess.run(base, capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        self.write_inputs()
+        for version in ("v1", "9.9.9"):
+            failed = subprocess.run(self.command(version, str(checklist_file), str(template_file),
+                                                 str(rollback_file)),
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        # A missing input file fails and the store is never touched.
+        failed = subprocess.run(self.command("1.2.0", str(Path(self.temp.name) / "nope.json"),
+                                             str(template_file), str(rollback_file)),
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty, fails as unknown, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"),
+                                 "--store", str(store), "record-release", "1.2.0",
+                                 str(checklist_file), str(template_file), str(rollback_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
