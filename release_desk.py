@@ -500,6 +500,89 @@ class ReleaseDesk:
         return {"version": version, "items": reconciled,
                 "retained": retained, "reset": reset, "added": added, "removed": removed}
 
+    def update_checklist(self, version, updates, checklist_path):
+        # Batch-update local checklist progress with optimistic concurrency:
+        # every expected status is checked against the file's current state
+        # before anything is written, and the file is replaced only when at
+        # least one status actually changes.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        normalized_updates = self._validated_updates(updates)
+        path = Path(checklist_path)
+        if path.is_symlink():
+            raise ValueError("checklist file must not be a symbolic link")
+        if _same_file(self.path, path):
+            raise ValueError("checklist file must not be the same file as the store")
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        # A missing target or an unreadable file raises OSError unchanged.
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+        try:
+            payload = _loads_unique(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+        items = self._validated_checklist(payload, version)
+        by_id = {item["id"]: item for item in items}
+        for update in normalized_updates:
+            item = by_id.get(update["id"])
+            if item is None:
+                raise ValueError("update id is not a checklist item")
+            if item["status"] != update["expected"]:
+                raise ValueError("expected checklist status does not match the current status")
+        updated = []
+        for item in items:
+            for update in normalized_updates:
+                if item["id"] == update["id"]:
+                    if item["status"] != update["status"]:
+                        item["status"] = update["status"]
+                        updated.append(item["id"])
+                    break
+        changed = bool(updated)
+        ready = all(not item["required"] or item["status"] == "done" for item in items)
+        if changed:
+            content = json.dumps({"version": version, "items": items},
+                                 ensure_ascii=False, indent=2) + "\n"
+            _atomic_write(path, content)
+        return {"version": version, "changed": changed, "items": items,
+                "updated": updated, "ready": ready}
+
+    @staticmethod
+    def _validated_updates(updates):
+        # Each update holds exactly id, expected and status; ids follow the
+        # single-line non-empty trimming rule and must be unique after
+        # trimming, case-sensitively and without Unicode normalization.
+        if not isinstance(updates, list):
+            raise ValueError("updates must be an array")
+        normalized = []
+        seen = set()
+        for update in updates:
+            if not isinstance(update, dict):
+                raise ValueError("updates require id, expected and status")
+            if set(update) != {"id", "expected", "status"}:
+                raise ValueError("updates require exactly id, expected and status")
+            item_id = update["id"]
+            if (not isinstance(item_id, str) or not item_id.strip()
+                    or "\n" in item_id or "\r" in item_id):
+                raise ValueError("update id must be a non-empty single-line string")
+            if update["expected"] not in CHECK_STATUSES:
+                raise ValueError("update expected status must be done, pending or blocked")
+            if update["status"] not in CHECK_STATUSES:
+                raise ValueError("update status must be done, pending or blocked")
+            item_id = item_id.strip()
+            # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+            if item_id in seen:
+                raise ValueError("update id must be unique")
+            seen.add(item_id)
+            normalized.append({"id": item_id, "expected": update["expected"],
+                               "status": update["status"]})
+        return normalized
+
     def migrate_checklist(self, base_version, target_version, checklist, template):
         # Read-only cross-version migration: only progress still backed by the
         # target release is inherited. Unlike reconcile_checklist, a same-id
@@ -961,6 +1044,10 @@ def main():
     migrate.add_argument("target_version")
     migrate.add_argument("checklist")
     migrate.add_argument("template")
+    update_checklist = commands.add_parser("update-checklist")
+    update_checklist.add_argument("version")
+    update_checklist.add_argument("updates")
+    update_checklist.add_argument("checklist")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1094,6 +1181,16 @@ def main():
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.migrate_checklist(args.base_version, args.target_version,
                                                 checklist_payload, template_payload)
+            elif args.command == "update-checklist":
+                try:
+                    updates_payload = _loads_unique(Path(args.updates).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("updates file must contain UTF-8 encoded JSON") from exc
+                checklist_path = Path(args.checklist)
+                if _same_file(Path(args.updates), checklist_path):
+                    raise ValueError(
+                        "checklist file must not be the same file as the updates file")
+                result = desk.update_checklist(args.version, updates_payload, checklist_path)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:

@@ -2124,6 +2124,340 @@ class MigrateChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class UpdateChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+        self.checklist = Path(self.temp.name) / "checklist.json"
+        self.items = [
+            {"id": "docs", "text": " Write notes ", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"},
+        ]
+
+    def write_checklist(self, items=None, version="1.2.0", raw=None):
+        if raw is not None:
+            self.checklist.write_bytes(raw)
+            return self.checklist
+        payload = {"version": version, "items": self.items if items is None else items}
+        self.checklist.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        return self.checklist
+
+    def update(self, updates, version="1.2.0"):
+        return self.desk.update_checklist(version, updates, self.checklist)
+
+    def test_report_shape_and_file_replaced_on_change(self):
+        self.write_checklist()
+        result = self.update([
+            {"id": " sign ", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "blocked", "status": "pending"}])
+        self.assertEqual(set(result), {"version", "changed", "items", "updated", "ready"})
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["updated"], ["sign", "nice"])
+        self.assertTrue(result["ready"])
+        self.assertEqual([item["id"] for item in result["items"]], ["docs", "sign", "nice"])
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["done", "done", "pending"])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+        self.assertEqual(result["items"][0]["text"], "Write notes")
+        raw = self.checklist.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        stored = json.loads(raw.decode("utf-8"))
+        self.assertEqual(set(stored), {"version", "items"})
+        self.assertEqual(stored["items"], result["items"])
+
+    def test_no_change_keeps_bytes_and_mtime(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        mtime = self.checklist.stat().st_mtime_ns
+        result = self.update([
+            {"id": "docs", "expected": "done", "status": "done"},
+            {"id": "sign", "expected": "pending", "status": "pending"}])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated"], [])
+        self.assertFalse(result["ready"])
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["done", "pending", "blocked"])
+        self.assertEqual(self.checklist.read_bytes(), before)
+        self.assertEqual(self.checklist.stat().st_mtime_ns, mtime)
+
+    def test_empty_updates_change_nothing_but_validate_everything(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        result = self.update([])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated"], [])
+        self.assertFalse(result["ready"])
+        self.assertEqual(self.checklist.read_bytes(), before)
+        # Empty updates still reject an invalid or unknown version.
+        with self.assertRaises(ValueError):
+            self.update([], version="v1")
+        missing_desk = ReleaseDesk(Path(self.temp.name) / "no-store" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing_desk.update_checklist("1.2.0", [], self.checklist)
+        # Empty updates still reject an invalid checklist file.
+        self.write_checklist(raw=b"{not json")
+        with self.assertRaises(ValueError):
+            self.update([])
+
+    def test_expected_checked_against_current_for_every_update(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        # Wrong expected status aborts the whole batch, even when the target
+        # status equals the current one.
+        for updates in (
+                [{"id": "sign", "expected": "blocked", "status": "done"}],
+                [{"id": "sign", "expected": "done", "status": "done"}],
+                [{"id": "docs", "expected": "pending", "status": "pending"}],
+                [{"id": "sign", "expected": "pending", "status": "done"},
+                 {"id": "docs", "expected": "pending", "status": "done"}]):
+            with self.assertRaises(ValueError, msg=updates):
+                self.update(updates)
+            self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_statuses_switch_between_any_states(self):
+        self.write_checklist()
+        result = self.update([{"id": "docs", "expected": "done", "status": "blocked"},
+                              {"id": "sign", "expected": "pending", "status": "done"},
+                              {"id": "nice", "expected": "blocked", "status": "done"}])
+        self.assertEqual(result["updated"], ["docs", "sign", "nice"])
+        self.assertFalse(result["ready"])
+
+    def test_invalid_updates_structure(self):
+        self.write_checklist()
+        good = {"id": "sign", "expected": "pending", "status": "done"}
+        cases = [
+            None, {}, "x", 1,
+            [None], [[]], [1], ["x"],
+            [{k: v for k, v in good.items() if k != "status"}],
+            [{"id": "sign", "expected": "pending"}],
+            [{"id": "sign", "status": "done"}],
+            [{"expected": "pending", "status": "done"}],
+            [{**good, "extra": 1}],
+            [{**good, "id": None}], [{**good, "id": 3}],
+            [{**good, "id": "  "}], [{**good, "id": "a\nb"}], [{**good, "id": "a\rb"}],
+            [{**good, "expected": "DONE"}], [{**good, "expected": None}],
+            [{**good, "expected": "started"}],
+            [{**good, "status": "DONE"}], [{**good, "status": None}],
+            [{"id": "sign", "expected": "pending", "status": "done"},
+             {"id": " sign ", "expected": "done", "status": "pending"}],
+        ]
+        before = self.checklist.read_bytes()
+        for updates in cases:
+            with self.assertRaises(ValueError, msg=repr(updates)):
+                self.update(updates)
+            self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_case_sensitive_ids_without_trim_collision_or_normalization(self):
+        self.write_checklist(items=[
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "A", "text": "Big A", "required": False, "status": "pending"},
+        ])
+        result = self.update([{"id": " a ", "expected": "pending", "status": "done"}])
+        self.assertEqual(result["updated"], ["a"])
+        self.assertTrue(result["ready"])
+        with self.assertRaises(ValueError):
+            self.update([{"id": "B", "expected": "pending", "status": "done"}])
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        self.write_checklist(items=[
+            {"id": composed, "text": "Composed", "required": True, "status": "pending"},
+            {"id": decomposed, "text": "Decomposed", "required": False, "status": "pending"},
+        ])
+        result = self.update([{"id": decomposed, "expected": "pending", "status": "done"}])
+        self.assertEqual(result["updated"], [decomposed])
+        with self.assertRaises(ValueError):
+            self.update([{"id": "cafe", "expected": "pending", "status": "done"}])
+
+    def test_unknown_id_rejected_without_write(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        with self.assertRaises(ValueError):
+            self.update([{"id": "missing", "expected": "pending", "status": "done"}])
+        with self.assertRaises(ValueError):
+            self.update([
+                {"id": "sign", "expected": "pending", "status": "done"},
+                {"id": "nope", "expected": "pending", "status": "done"}])
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_invalid_and_unknown_versions(self):
+        self.write_checklist()
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.update([], version=version)
+        with self.assertRaises(ValueError):
+            self.update([{"id": "sign", "expected": "pending", "status": "done"}],
+                        version="9.9.9")
+
+    def test_checklist_version_must_match_and_be_registered(self):
+        self.write_checklist(version="1.0.0")
+        with self.assertRaises(ValueError):
+            self.update([])
+        self.desk.add("1.0.0", [{"category": "Added", "text": "Only"}])
+        with self.assertRaises(ValueError):
+            self.update([])
+
+    def test_invalid_checklist_files_rejected(self):
+        valid_items = [{"id": "a", "text": "A", "required": True, "status": "pending"}]
+        cases = [
+            b"{not json", b"\xff\xfe", b"", b"null", b"[1]", b"1", b'"x"',
+            b'{"version": "1.2.0", "items": []}',
+            b'{"version": "v1", "items": [{"id": "a", "text": "A",'
+            b' "required": true, "status": "done"}]}',
+            b'{"version": "1.2.0", "items": [{"id": "a", "text": "A",'
+            b' "required": false, "status": "done"}]}',
+            b'{"version": "1.2.0", "version": "1.2.0",'
+            b' "items": [{"id": "a", "text": "A", "required": true, "status": "done"}]}',
+            b'{"version": "1.2.0", "items": [{"id": "a", "text": "A",'
+            b' "required": true, "status": "done", "status": "pending"}]}',
+        ]
+        for raw in cases:
+            self.write_checklist(raw=raw)
+            with self.assertRaises(ValueError, msg=raw):
+                self.update([{"id": "a", "expected": "pending", "status": "done"}])
+
+    def test_missing_target_raises_oserror_and_creates_nothing(self):
+        missing = Path(self.temp.name) / "missing-dir" / "checklist.json"
+        with self.assertRaises(OSError):
+            self.desk.update_checklist("1.2.0", [], missing)
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+
+    def test_symlink_target_rejected(self):
+        self.write_checklist()
+        link = Path(self.temp.name) / "link.json"
+        link.symlink_to(self.checklist)
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [], link)
+        self.assertEqual(link.read_bytes(), self.checklist.read_bytes())
+
+    def test_target_must_not_be_store_alias_or_hard_link(self):
+        self.write_checklist()
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [], self.path)
+        alias = Path(self.temp.name) / ".." / Path(self.temp.name).name / "releases.json"
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [], alias)
+        hard = Path(self.temp.name) / "hard.json"
+        os.link(self.path, hard)
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [], hard)
+        self.assertEqual(self.desk.versions(), ["1.2.0"])
+
+    def test_failure_preserves_target_and_store_bytes(self):
+        self.write_checklist()
+        target_before = self.checklist.read_bytes()
+        store_before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.update([{"id": "sign", "expected": "done", "status": "done"}])
+        self.assertEqual(self.checklist.read_bytes(), target_before)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+    def test_inputs_untouched_and_result_detached(self):
+        self.write_checklist()
+        updates = [{"id": " sign ", "expected": "pending", "status": "done"}]
+        snapshot = json.loads(json.dumps(updates))
+        result = self.update(updates)
+        self.assertEqual(updates, snapshot)
+        result["items"][0]["status"] = "blocked"
+        result["items"].append({"id": "x", "text": "X", "required": True, "status": "done"})
+        self.assertEqual(updates, snapshot)
+        again = self.desk.update_checklist("1.2.0", [], self.checklist)
+        self.assertEqual([item["status"] for item in again["items"]],
+                         ["done", "done", "blocked"])
+
+    def test_cli_update_checklist(self):
+        self.write_checklist()
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        updates = Path(self.temp.name) / "updates.json"
+        updates.write_text(json.dumps([
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "blocked", "status": "pending"}]), encoding="utf-8")
+        result = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                          str(updates), str(self.checklist)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report), {"version", "changed", "items", "updated", "ready"})
+        self.assertTrue(report["changed"])
+        self.assertEqual(report["updated"], ["sign", "nice"])
+        self.assertTrue(report["ready"])
+        # Re-running with the stale expected status fails and leaves the file.
+        before = self.checklist.read_bytes()
+        stale = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                         str(updates), str(self.checklist)],
+                               capture_output=True, text=True)
+        self.assertEqual(stale.returncode, 2)
+        self.assertEqual(set(json.loads(stale.stdout)), {"error"})
+        self.assertEqual(self.checklist.read_bytes(), before)
+        # A matching no-change batch succeeds, prints changed false and keeps
+        # the bytes.
+        updates.write_text(json.dumps([
+            {"id": "sign", "expected": "done", "status": "done"},
+            {"id": "nice", "expected": "pending", "status": "pending"}]), encoding="utf-8")
+        steady = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                          str(updates), str(self.checklist)],
+                                capture_output=True, text=True)
+        self.assertEqual(steady.returncode, 0, steady.stderr)
+        self.assertFalse(json.loads(steady.stdout)["changed"])
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_cli_update_checklist_errors(self):
+        self.write_checklist()
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        updates = Path(self.temp.name) / "updates.json"
+        target_before = self.checklist.read_bytes()
+        store_before = self.path.read_bytes()
+        good = [{"id": "sign", "expected": "pending", "status": "done"}]
+        cases = [b"{not json", b"\xff\xfe", b"{}", b"null",
+                 b'[{"id": "sign", "expected": "pending", "status": "done"},'
+                 b' {"id": "sign", "expected": "done", "status": "pending"}]',
+                 b'[{"id": "sign", "expected": "pending","status": "done",'
+                 b' "status": "done"}]']
+        for raw in cases:
+            updates.write_bytes(raw)
+            failed = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                              str(updates), str(self.checklist)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        self.assertEqual(self.checklist.read_bytes(), target_before)
+        # Bad version, unknown release and a missing target fail with exit 2.
+        updates.write_text(json.dumps(good), encoding="utf-8")
+        for arguments in (
+                ["update-checklist", "v1", str(updates), str(self.checklist)],
+                ["update-checklist", "9.9.9", str(updates), str(self.checklist)]):
+            failed = subprocess.run(prefix + arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        missing = Path(self.temp.name) / "missing-dir" / "checklist.json"
+        failed = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                          str(updates), str(missing)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+        # The target must not alias the store or the updates file.
+        for target in (str(self.path), str(updates)):
+            failed = subprocess.run(prefix + ["update-checklist", "1.2.0",
+                                              str(updates), target],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, target)
+            self.assertIn("error", json.loads(failed.stdout))
+        updates_before = updates.read_bytes()
+        self.assertEqual(updates.read_bytes(), updates_before)
+        self.assertEqual(self.checklist.read_bytes(), target_before)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+
 class ConfigDiffTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
