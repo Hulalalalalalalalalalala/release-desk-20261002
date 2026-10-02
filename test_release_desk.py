@@ -1122,5 +1122,297 @@ class GenerateChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class AuditChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Retry empty exports"}])
+
+    def template(self, **overrides):
+        data = {
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True},
+                {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+                {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def checklist(self, **overrides):
+        data = {
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": " Write notes ", "required": True, "status": "done"},
+                {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_full_match_ready_and_report_shape(self):
+        report = self.desk.audit_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual(set(report), {"version", "ready", "done", "pending", "blocked",
+                                       "missing", "mismatched", "unexpected"})
+        self.assertEqual(report["version"], "1.2.0")
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["done"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"}])
+        self.assertEqual(report["pending"], [])
+        self.assertEqual(report["blocked"], [])
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["mismatched"], [])
+        self.assertEqual(report["unexpected"], [])
+
+    def test_missing_mismatched_unexpected(self):
+        checklist = self.checklist()
+        checklist["items"] = [
+            {"id": "extra", "text": "Surprise", "required": False, "status": "pending"},
+            {"id": "docs", "text": "Write docs", "required": True, "status": "done"},
+        ]
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["missing"], [
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"}])
+        self.assertEqual(report["mismatched"], [{
+            "expected": {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            "actual": {"id": "docs", "text": "Write docs", "required": True, "status": "done"}}])
+        self.assertEqual(report["unexpected"], [
+            {"id": "extra", "text": "Surprise", "required": False, "status": "pending"}])
+        self.assertEqual([item["id"] for item in report["pending"]], ["extra"])
+        self.assertEqual([item["id"] for item in report["done"]], ["docs"])
+
+    def test_missing_and_mismatched_follow_template_order(self):
+        template = self.template()
+        template["items"] = [
+            {"id": "one", "text": "One", "required": True},
+            {"id": "two", "text": "Two", "required": True},
+            {"id": "three", "text": "Three", "required": False},
+        ]
+        checklist = self.checklist()
+        checklist["items"] = [
+            {"id": "two", "text": "2", "required": True, "status": "done"},
+            {"id": "three", "text": "3", "required": False, "status": "done"},
+        ]
+        report = self.desk.audit_checklist("1.2.0", checklist, template)
+        self.assertEqual([item["id"] for item in report["missing"]], ["one"])
+        self.assertEqual([entry["expected"]["id"] for entry in report["mismatched"]], ["two", "three"])
+
+    def test_unexpected_follows_checklist_order(self):
+        checklist = self.checklist()
+        checklist["items"] = [
+            {"id": "zeta", "text": "Z", "required": False, "status": "blocked"},
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "alpha", "text": "A", "required": False, "status": "pending"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+        ]
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["unexpected"]], ["zeta", "alpha"])
+
+    def test_optional_template_differences_do_not_block_ready(self):
+        template = self.template()
+        template["items"].append({"id": "opt", "text": "Optional", "required": False})
+        template["items"][1] = {"id": "fixed", "text": "Verify fix", "required": False,
+                                "categories": ["Fixed"]}
+        checklist = self.checklist()
+        checklist["items"][1]["text"] = "Changed text"
+        report = self.desk.audit_checklist("1.2.0", checklist, template)
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["missing"]], ["opt"])
+        self.assertEqual([entry["expected"]["id"] for entry in report["mismatched"]], ["fixed"])
+
+    def test_checklist_not_ready_blocks_ready(self):
+        checklist = self.checklist()
+        checklist["items"][1]["status"] = "blocked"
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["mismatched"], [])
+
+    def test_missing_required_template_item_blocks_ready(self):
+        checklist = self.checklist()
+        checklist["items"] = checklist["items"][:1]
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["missing"]], ["fixed"])
+
+    def test_required_flag_mismatch_blocks_ready(self):
+        checklist = self.checklist()
+        checklist["items"][1]["required"] = False
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["mismatched"], [{
+            "expected": {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"},
+            "actual": {"id": "fixed", "text": "Verify fix", "required": False, "status": "done"}}])
+
+    def test_id_matching_is_case_sensitive_without_unicode_normalization(self):
+        checklist = self.checklist()
+        checklist["items"][0]["id"] = "DOCS"
+        checklist["items"][1]["id"] = "fixed"
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["missing"]], ["docs"])
+        self.assertEqual([item["id"] for item in report["unexpected"]], ["DOCS"])
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        template = self.template()
+        template["items"][0]["id"] = composed
+        checklist = self.checklist()
+        checklist["items"][0]["id"] = decomposed
+        report = self.desk.audit_checklist("1.2.0", checklist, template)
+        self.assertEqual([item["id"] for item in report["missing"]], [composed])
+        self.assertEqual([item["id"] for item in report["unexpected"]], [decomposed])
+
+    def test_status_never_inferred_from_text(self):
+        checklist = self.checklist()
+        checklist["items"][0]["text"] = "Write notes"
+        checklist["items"][1]["status"] = "pending"
+        report = self.desk.audit_checklist("1.2.0", checklist, self.template())
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["pending"]], ["fixed"])
+
+    def test_invalid_version_and_unknown_release(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.audit_checklist(version, self.checklist(), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("9.9.9", self.checklist(), self.template())
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.audit_checklist("1.2.0", self.checklist(), self.template())
+        self.assertFalse(missing.path.parent.exists())
+
+    def test_invalid_checklist_and_template(self):
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(version="2.0.0"), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", {"version": "1.2.0", "items": []}, self.template())
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), {"items": []})
+        # Template items are fully validated even when the filter would drop them.
+        template = self.template()
+        template["items"][2]["text"] = "A\nB"
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), template)
+
+    def test_empty_selection_and_no_required_rejected(self):
+        only_added = {"items": [
+            {"id": "a", "text": "A", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), only_added)
+        no_required = {"items": [
+            {"id": "docs", "text": "Write notes", "required": False},
+            {"id": "fixed", "text": "Verify fix", "required": False, "categories": ["Fixed"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), no_required)
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual(self.path.read_bytes(), raw)
+        raw = b'{"1.2.0": [], "1.2.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.audit_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.audit_checklist("1.2.0", self.checklist(), self.template())
+
+    def test_readonly_and_inputs_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist, template = self.checklist(), self.template()
+        snapshot = json.loads(json.dumps([checklist, template]))
+        report = self.desk.audit_checklist("1.2.0", checklist, template)
+        self.assertTrue(report["ready"])
+        self.assertEqual([checklist, template], snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_audit_checklist(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        result = subprocess.run(prefix + ["audit-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["missing"], [])
+        # A valid but unready audit still exits 0.
+        checklist.write_text(json.dumps(self.checklist(items=[
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"}])),
+            encoding="utf-8")
+        result = subprocess.run(prefix + ["audit-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["missing"]], ["fixed"])
+
+    def test_cli_audit_checklist_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        cases = [
+            ("{not json", None),
+            (None, "{not json"),
+            (b"\xff\xfe", None),
+            (None, b"\xff\xfe"),
+            ('{"version": "1.2.0", "version": "1.2.0", "items": []}', None),
+            (None, '{"items": [{"id": "a", "id": "a", "text": "A", "required": true}]}'),
+            (json.dumps(self.checklist(version="2.0.0")), None),
+            (None, json.dumps({"items": []})),
+        ]
+        def write(path, content):
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding="utf-8")
+
+        for checklist_case, template_case in cases:
+            if checklist_case is not None:
+                write(checklist, checklist_case)
+            if template_case is not None:
+                write(template, template_case)
+            result = subprocess.run(prefix + ["audit-checklist", "1.2.0", str(checklist), str(template)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, (checklist_case, template_case))
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+            checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+            template.write_text(json.dumps(self.template()), encoding="utf-8")
+        for version in ("v1", "9.9.9"):
+            result = subprocess.run(prefix + ["audit-checklist", version, str(checklist), str(template)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        absent = subprocess.run(prefix + ["audit-checklist", "1.2.0",
+                                          str(Path(self.temp.name) / "nope.json"), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty, fails as unknown, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "audit-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
