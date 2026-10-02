@@ -656,5 +656,241 @@ class ReleaseDeskTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.changes = [{"category": "Added", "text": "One"}, {"category": "Fixed", "text": "Two"}]
+        self.desk.add("1.2.0", self.changes)
+
+    def payload(self, **overrides):
+        data = {
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": " Write notes ", "required": True, "status": "done"},
+                {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+                {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_groups_keep_order_and_report_shape(self):
+        not_ready = self.desk.checklist("1.2.0", self.payload())
+        self.assertEqual(set(not_ready), {"version", "ready", "done", "pending", "blocked"})
+        self.assertFalse(not_ready["ready"])
+        self.assertEqual(not_ready["done"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"}])
+        self.assertEqual(not_ready["pending"], [
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"}])
+        self.assertEqual(not_ready["blocked"], [
+            {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"}])
+        for group in ("done", "pending", "blocked"):
+            for item in not_ready[group]:
+                self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_ready_when_all_required_done_optional_open(self):
+        data = self.payload()
+        data["items"][1]["status"] = "done"
+        report = self.desk.checklist("1.2.0", data)
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["done"]], ["docs", "sign"])
+        self.assertEqual([item["id"] for item in report["blocked"]], ["nice"])
+
+    def test_optional_never_blocks(self):
+        data = self.payload()
+        data["items"][1]["status"] = "done"
+        data["items"][2]["status"] = "pending"
+        self.assertTrue(self.desk.checklist("1.2.0", data)["ready"])
+
+    def test_required_blocked_is_not_ready(self):
+        data = self.payload()
+        data["items"][1]["status"] = "done"
+        data["items"][2] = {"id": "gate", "text": "Gate", "required": True, "status": "blocked"}
+        self.assertFalse(self.desk.checklist("1.2.0", data)["ready"])
+
+    def test_group_order_follows_input(self):
+        data = self.payload()
+        data["items"] = [
+            {"id": "a", "text": "A", "required": False, "status": "pending"},
+            {"id": "b", "text": "B", "required": True, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+        ]
+        report = self.desk.checklist("1.2.0", data)
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["pending"]], ["a", "c"])
+
+    def test_duplicate_titles_legal_but_ids_case_sensitive(self):
+        data = self.payload()
+        data["items"] = [
+            {"id": "Same", "text": "Title", "required": True, "status": "done"},
+            {"id": "same", "text": "Title", "required": False, "status": "pending"},
+            {"id": " SAME ", "text": "Title", "required": False, "status": "blocked"},
+        ]
+        report = self.desk.checklist("1.2.0", data)
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["done"]], ["Same"])
+        self.assertEqual([item["id"] for item in report["pending"]], ["same"])
+        self.assertEqual([item["id"] for item in report["blocked"]], ["SAME"])
+
+    def test_duplicate_ids_rejected_after_trim(self):
+        data = self.payload()
+        data["items"][1]["id"] = " docs "
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.2.0", data)
+
+    def test_no_unicode_normalization_on_ids(self):
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        self.assertNotEqual(composed, decomposed)
+        data = self.payload()
+        data["items"] = [
+            {"id": composed, "text": "Composed", "required": True, "status": "done"},
+            {"id": decomposed, "text": "Decomposed", "required": False, "status": "pending"},
+        ]
+        report = self.desk.checklist("1.2.0", data)
+        self.assertEqual([item["id"] for item in report["pending"]], [decomposed])
+
+    def test_invalid_versions(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.checklist(version, self.payload())
+
+    def test_invalid_payload_structures(self):
+        invalid = [
+            None, [], "x", 1,
+            {"items": []},
+            {"version": "1.2.0"},
+            {"version": "1.2.0", "items": {}},
+            {"version": "1.2.0", "items": []},
+            {"version": "v1", "items": [{"id": "a", "text": "A", "required": True, "status": "done"}]},
+            {"version": "2.0.0", "items": [{"id": "a", "text": "A", "required": True, "status": "done"}]},
+        ]
+        for payload in invalid:
+            with self.assertRaises(ValueError):
+                self.desk.checklist("1.2.0", payload)
+
+    def test_invalid_items(self):
+        good = {"id": "a", "text": "A", "required": True, "status": "done"}
+        variants = [
+            [], "x", None, 1,
+            {**good, "id": None}, {**good, "id": 1}, {**good, "id": "  "},
+            {**good, "id": "a\nb"}, {**good, "id": "a\rb"},
+            {**good, "text": ""}, {**good, "text": 3}, {**good, "text": "x\ny"},
+            {**good, "required": "yes"}, {**good, "required": 1}, {**good, "required": None},
+            {**good, "status": "DONE"}, {**good, "status": "started"}, {**good, "status": None},
+        ]
+        for item in variants:
+            with self.assertRaises(ValueError):
+                self.desk.checklist("1.2.0", {"version": "1.2.0", "items": [item]})
+
+    def test_all_optional_rejected(self):
+        payload = {"version": "1.2.0", "items": [
+            {"id": "a", "text": "A", "required": False, "status": "done"}]}
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.2.0", payload)
+
+    def test_extra_fields_ignored(self):
+        payload = {"version": "1.2.0", "extra": "ignored", "items": [
+            {"id": "a", "text": " A ", "required": True, "status": "done", "other": 1, "notes": "x"}]}
+        report = self.desk.checklist("1.2.0", payload)
+        self.assertEqual(report["done"], [{"id": "a", "text": "A", "required": True, "status": "done"}])
+
+    def test_unknown_version_and_missing_store(self):
+        with self.assertRaises(ValueError):
+            self.desk.checklist("9.9.9", self.payload())
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.checklist("1.2.0", self.payload())
+
+    def test_version_mismatch_without_touching_store(self):
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.0.0", self.payload())
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.2.0": [{"category": "Added", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.2.0", self.payload())
+        self.assertEqual(self.path.read_bytes(), raw)
+        raw = b'{"1.2.0": [], "1.2.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.checklist("1.2.0", self.payload())
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.2.0", self.payload())
+
+    def test_readonly_and_inputs_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        payload = self.payload()
+        snapshot = json.loads(json.dumps(payload))
+        not_ready = self.desk.checklist("1.2.0", payload)
+        self.assertFalse(not_ready["ready"])
+        self.assertEqual(payload, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_check(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        ready = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": " Notes ", "required": True, "status": "done"},
+            {"id": "later", "text": "Later", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(ready), encoding="utf-8")
+        result = subprocess.run(prefix + ["check", "1.2.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "version": "1.2.0", "ready": True,
+            "done": [{"id": "docs", "text": "Notes", "required": True, "status": "done"}],
+            "pending": [{"id": "later", "text": "Later", "required": False, "status": "pending"}],
+            "blocked": []})
+        not_ready = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Notes", "required": True, "status": "blocked"}]}
+        checklist.write_text(json.dumps(not_ready), encoding="utf-8")
+        result = subprocess.run(prefix + ["check", "1.2.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(json.loads(result.stdout)["ready"])
+
+    def test_cli_check_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            json.dumps({"version": "2.0.0", "items": [
+                {"id": "a", "text": "A", "required": True, "status": "done"}]}),
+            json.dumps({"version": "1.2.0", "items": [
+                {"id": "a", "text": "A", "required": False, "status": "done"}]}),
+            json.dumps({"version": "1.2.0", "items": [
+                {"id": "a", "text": "A", "required": True, "status": "done"},
+                {"id": "a", "text": "B", "required": False, "status": "pending"}]}),
+            '{"version": "1.2.0", "version": "1.2.0", "items": []}',
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                checklist.write_bytes(case)
+            else:
+                checklist.write_text(case, encoding="utf-8")
+            result = subprocess.run(prefix + ["check", "1.2.0", str(checklist)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        checklist.write_text(json.dumps({"version": "9.9.9", "items": [
+            {"id": "a", "text": "A", "required": True, "status": "done"}]}), encoding="utf-8")
+        missing = subprocess.run(prefix + ["check", "9.9.9", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        absent = subprocess.run(prefix + ["check", "1.2.0", str(Path(self.temp.name) / "nope.json")],
+                                capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
