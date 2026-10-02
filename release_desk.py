@@ -560,6 +560,94 @@ class ReleaseDesk:
                 "retained": retained, "reset": reset, "added": added_ids,
                 "removed": removed_ids}
 
+    def update_checklist(self, version, updates, checklist_path):
+        # Batch-update the statuses of a local checklist file after confirming
+        # every expected status still matches the read bytes: one mismatch
+        # rejects the whole batch. Only when at least one status changes is the
+        # target replaced wholesale with UTF-8 JSON ending in a newline;
+        # otherwise its bytes and modification time are left untouched.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        normalized_updates = self._validated_updates(updates)
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        path = Path(checklist_path)
+        if path.is_symlink():
+            raise ValueError("checklist file must not be a symbolic link")
+        if _same_file(self.path, path):
+            raise ValueError("checklist file must not be the same file as the store")
+        # A missing target or an unreadable file raises OSError unchanged, and
+        # no missing file or directory is ever created.
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+        try:
+            payload = _loads_unique(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+        items = self._validated_checklist(payload, version)
+        status_by_id = {item["id"]: item["status"] for item in items}
+        # Ids match case-sensitively after trimming, without Unicode
+        # normalization; every expected status is checked, including entries
+        # whose target status would not change anything.
+        for item_id, expected, _status in normalized_updates:
+            actual = status_by_id.get(item_id)
+            if actual is None:
+                raise ValueError("update item id must exist in the checklist")
+            if actual != expected:
+                raise ValueError("update expected status does not match the checklist")
+        updated, resulting = [], []
+        targets = {item_id: status for item_id, _expected, status in normalized_updates}
+        for item in items:
+            item_id = item["id"]
+            if item_id in targets and targets[item_id] != item["status"]:
+                updated.append(item_id)
+                resulting.append({"id": item["id"], "text": item["text"],
+                                  "required": item["required"], "status": targets[item_id]})
+            else:
+                resulting.append(dict(item))
+        changed = bool(updated)
+        if changed:
+            content = json.dumps({"version": version, "items": resulting},
+                                 ensure_ascii=False, indent=2) + "\n"
+            _atomic_write(path, content)
+        ready = all(item["status"] == "done" for item in resulting if item["required"])
+        return {"version": version, "changed": changed, "items": resulting,
+                "updated": updated, "ready": ready}
+
+    @staticmethod
+    def _validated_updates(updates):
+        # Validate the status update batch: an array (possibly empty) of
+        # objects holding exactly id, expected and status. Ids follow the
+        # single-line checklist id rule; expected/status are known statuses and
+        # any status may switch to any other. Normalized ids must be unique.
+        if not isinstance(updates, list):
+            raise ValueError("checklist updates must be an array")
+        normalized = []
+        seen = set()
+        for update in updates:
+            if not isinstance(update, dict):
+                raise ValueError("checklist updates require id, expected and status")
+            if set(update) != {"id", "expected", "status"}:
+                raise ValueError("checklist updates require exactly id, expected and status")
+            item_id, expected, status = update["id"], update["expected"], update["status"]
+            if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
+                raise ValueError("checklist item id must be a non-empty single-line string")
+            if expected not in CHECK_STATUSES or status not in CHECK_STATUSES:
+                raise ValueError("checklist item status must be done, pending or blocked")
+            item_id = item_id.strip()
+            # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+            if item_id in seen:
+                raise ValueError("checklist update id must be unique")
+            seen.add(item_id)
+            normalized.append((item_id, expected, status))
+        return normalized
+
     @staticmethod
     def _applicable_template_items(items, changes):
         present = {change["category"] for change in changes}
@@ -961,6 +1049,10 @@ def main():
     migrate.add_argument("target_version")
     migrate.add_argument("checklist")
     migrate.add_argument("template")
+    update_checklist = commands.add_parser("update-checklist")
+    update_checklist.add_argument("version")
+    update_checklist.add_argument("updates")
+    update_checklist.add_argument("checklist")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1094,6 +1186,16 @@ def main():
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.migrate_checklist(args.base_version, args.target_version,
                                                 checklist_payload, template_payload)
+            elif args.command == "update-checklist":
+                try:
+                    updates_payload = _loads_unique(Path(args.updates).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("updates file must contain UTF-8 encoded JSON") from exc
+                checklist_path = Path(args.checklist)
+                if _same_file(Path(args.updates), checklist_path):
+                    raise ValueError(
+                        "checklist file must not be the same file as the updates file")
+                result = desk.update_checklist(args.version, updates_payload, checklist_path)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
