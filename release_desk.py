@@ -500,6 +500,66 @@ class ReleaseDesk:
         return {"version": version, "items": reconciled,
                 "retained": retained, "reset": reset, "added": added, "removed": removed}
 
+    def migrate_checklist(self, base_version, target_version, checklist, template):
+        # Read-only cross-version migration: only progress still backed by the
+        # target release is inherited. Unlike reconcile_checklist, a same-id
+        # item whose definition is unchanged keeps its status solely when the
+        # change entries covered by the item's template categories are
+        # identical between the two registered releases.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        # The checklist is validated against the base version it declares; the
+        # template is validated in full before the target filter is applied.
+        items = self._validated_checklist(checklist, base_version)
+        template_items = self._validated_template(template)
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(template_items, records[target_version])
+        # Reuse the diff classification as the change comparison; the scope
+        # filters it down to the categories a template item declares. When the
+        # item declares none every category is compared, categories not present
+        # in the target release included.
+        added, removed, unchanged = self._diff_entries(
+            self._clean_changes(records[base_version]),
+            self._clean_changes(records[target_version]))
+        changed_by_category = {}
+        for category in CATEGORIES:
+            changed_by_category[category] = any(
+                entry["category"] == category for entry in added + removed)
+        previous = {item["id"]: item for item in items}
+        definitions = {item["id"]: item for item in template_items}
+        migrated, retained, reset, added_ids = [], [], [], []
+        for expected in selected:
+            item_id = expected["id"]
+            actual = previous.get(item_id)
+            if actual is None:
+                migrated.append(dict(expected))
+                added_ids.append(item_id)
+            elif actual["text"] != expected["text"] or actual["required"] != expected["required"]:
+                migrated.append(dict(expected))
+                reset.append(item_id)
+            else:
+                categories = definitions[item_id]["categories"]
+                scope = CATEGORIES if categories is None else tuple(categories)
+                if all(not changed_by_category[category] for category in scope):
+                    migrated.append({"id": item_id, "text": expected["text"],
+                                     "required": expected["required"], "status": actual["status"]})
+                    retained.append(item_id)
+                else:
+                    migrated.append(dict(expected))
+                    reset.append(item_id)
+        selected_ids = {item["id"] for item in selected}
+        removed_ids = [item["id"] for item in items if item["id"] not in selected_ids]
+        return {"baseVersion": base_version, "version": target_version,
+                "items": migrated,
+                "retained": retained, "reset": reset, "added": added_ids,
+                "removed": removed_ids}
+
     @staticmethod
     def _applicable_template_items(items, changes):
         present = {change["category"] for change in changes}
@@ -831,6 +891,11 @@ def main():
     reconcile.add_argument("version")
     reconcile.add_argument("checklist")
     reconcile.add_argument("template")
+    migrate = commands.add_parser("migrate-checklist")
+    migrate.add_argument("base_version")
+    migrate.add_argument("target_version")
+    migrate.add_argument("checklist")
+    migrate.add_argument("template")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -925,6 +990,17 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.reconcile_checklist(args.version, checklist_payload, template_payload)
+            elif args.command == "migrate-checklist":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                result = desk.migrate_checklist(args.base_version, args.target_version,
+                                                checklist_payload, template_payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
