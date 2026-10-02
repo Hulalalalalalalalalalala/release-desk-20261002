@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -351,6 +352,151 @@ class ReleaseDeskTests(unittest.TestCase):
         missing = subprocess.run(prefix + ["import", str(Path(self.temp.name) / "nope.json")], capture_output=True, text=True)
         self.assertEqual(missing.returncode, 2)
         self.assertIn("error", json.loads(missing.stdout))
+
+    def test_export_all_filter_empty_and_dedup(self):
+        self.desk.add("1.10.0", [{"category": "Fixed", "text": "Ten"}])
+        self.desk.add("1.2.0", [{"category": "Added", "text": "Two"}])
+        self.assertEqual(list(self.desk.export_releases()), ["1.2.0", "1.10.0"])
+        self.assertEqual(list(self.desk.export_releases(None)), ["1.2.0", "1.10.0"])
+        self.assertEqual(self.desk.export_releases([]), {})
+        picked = self.desk.export_releases(["1.10.0", "1.10.0"])
+        self.assertEqual(list(picked), ["1.10.0"])
+        chosen = self.desk.export_releases(["1.10.0", "1.2.0", "1.10.0"])
+        self.assertEqual(list(chosen), ["1.2.0", "1.10.0"])
+
+    def test_export_entries_trimmed_without_extra_fields(self):
+        self.path.write_text(json.dumps({
+            "1.0.0": [
+                {"category": "Fixed", "text": " 修复 重试 ", "extra": "dropped"},
+                {"category": "Fixed", "text": "修复 重试"},
+                {"category": "Added", "text": "New"},
+            ],
+        }), encoding="utf-8")
+        exported = self.desk.export_releases()
+        self.assertEqual(exported, {"1.0.0": [
+            {"category": "Fixed", "text": "修复 重试"},
+            {"category": "Fixed", "text": "修复 重试"},
+            {"category": "Added", "text": "New"},
+        ]})
+        self.assertEqual(set(exported["1.0.0"][0]), {"category", "text"})
+
+    def test_export_roundtrip_skips_on_repeat(self):
+        self.desk.add("1.10.0", [{"category": "Fixed", "text": " 重试 "}, {"category": "Fixed", "text": "重试"}])
+        self.desk.add("1.2.0", [{"category": "Added", "text": " New "}])
+        payload = self.desk.export_releases(["1.2.0", "1.10.0"])
+        fresh = ReleaseDesk(Path(self.temp.name) / "fresh.json")
+        self.assertEqual(fresh.import_releases(payload), {"imported": ["1.2.0", "1.10.0"], "skipped": []})
+        self.assertEqual(fresh.import_releases(payload), {"imported": [], "skipped": ["1.2.0", "1.10.0"]})
+
+    def test_export_readonly(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.desk.export_releases()
+        self.desk.export_releases(["1.0.0"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_export_validation(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        for versions in ("1.0.0", ["1.0.0", 1], ("1.0.0",), {"1.0.0"}, [None], [True]):
+            with self.assertRaises(ValueError):
+                self.desk.export_releases(versions)
+        for versions in (["v1"], ["1.0"], ["1.0.0.0"], ["01.0.0"]):
+            with self.assertRaises(ValueError):
+                self.desk.export_releases(versions)
+        with self.assertRaises(ValueError):
+            self.desk.export_releases(["9.9.9"])
+        # An unselected invalid record still fails validation.
+        self.path.write_text(json.dumps({"1.0.0": [{"category": "Added", "text": "One"}], "2.0.0": []}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.export_releases(["1.0.0"])
+        self.path.write_bytes(b'{"1.0.0": [], "1.0.0": []}')
+        with self.assertRaises(ValueError) as caught:
+            self.desk.export_releases(["1.0.0"])
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.export_releases()
+
+    def test_export_missing_store(self):
+        missing = Path(self.temp.name) / "no-store" / "releases.json"
+        desk = ReleaseDesk(missing)
+        self.assertEqual(desk.export_releases(), {})
+        self.assertFalse(missing.parent.exists())
+        with self.assertRaises(ValueError):
+            desk.export_releases(["1.0.0"])
+        self.assertFalse(missing.parent.exists())
+
+    def test_cli_export_stdout(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.10.0", [{"category": "Fixed", "text": "重试"}, {"category": "Fixed", "text": "重试"}])
+        self.desk.add("1.2.0", [{"category": "Added", "text": "中文 ✓"}])
+        result = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "1.2.0": [{"category": "Added", "text": "中文 ✓"}],
+            "1.10.0": [{"category": "Fixed", "text": "重试"}, {"category": "Fixed", "text": "重试"}],
+        })
+        picked = subprocess.run(prefix + ["export", "--version", "1.10.0", "--version", "1.10.0", "--version", "1.2.0"], capture_output=True, text=True)
+        self.assertEqual(list(json.loads(picked.stdout)), ["1.2.0", "1.10.0"])
+        missing = Path(self.temp.name) / "missing.json"
+        empty = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(missing), "export"], capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0)
+        self.assertEqual(empty.stdout.strip(), "{}")
+        self.assertFalse(missing.exists())
+
+    def test_cli_export_output_file(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": " 中文 "}])
+        target = Path(self.temp.name) / "nested" / "out.json"
+        result = subprocess.run(prefix + ["export", "--output", str(target)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"exported": ["1.0.0"]})
+        raw = target.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"1.0.0": [{"category": "Added", "text": "中文"}]})
+        # Existing targets are replaced wholesale.
+        target.write_text("PREVIOUS", encoding="utf-8")
+        result = subprocess.run(prefix + ["export", "--version", "1.0.0", "--output", str(target)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {"exported": ["1.0.0"]})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["1.0.0"], [{"category": "Added", "text": "中文"}])
+
+    def test_cli_export_same_file_as_store(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        script = str(ROOT / "release_desk.py")
+        alias = str(self.path.parent) + "/./" + self.path.name
+        attempts = [str(self.path), alias]
+        link = self.path.parent / "link.json"
+        link.symlink_to(self.path)
+        attempts.append(str(link))
+        hard = self.path.parent / "hard.json"
+        os.link(self.path, hard)
+        attempts.append(str(hard))
+        for output in attempts:
+            result = subprocess.run([sys.executable, script, "--store", str(self.path), "export", "--output", output], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, output)
+            self.assertIn("error", json.loads(result.stdout))
+        ghost = self.path.parent / "ghost.json"
+        result = subprocess.run([sys.executable, script, "--store", str(ghost), "export", "--output", "./" + ghost.name], cwd=ghost.parent, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(ghost.exists())
+
+    def test_cli_export_failure_preserves_target(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        target = Path(self.temp.name) / "target.json"
+        target.write_text("PRECIOUS", encoding="utf-8")
+        result = subprocess.run(prefix + ["export", "--version", "9.9.9", "--output", str(target)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        self.assertEqual(target.read_text(encoding="utf-8"), "PRECIOUS")
+        absent = Path(self.temp.name) / "missing-dir" / "target.json"
+        result = subprocess.run(prefix + ["export", "--version", "9.9.9", "--output", str(absent)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(absent.exists())
+        self.assertFalse(absent.parent.exists())
 
 
 if __name__ == "__main__":

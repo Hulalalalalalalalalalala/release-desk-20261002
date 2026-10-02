@@ -27,6 +27,41 @@ def _loads_unique(raw):
     return json.loads(raw, object_pairs_hook=_unique_object)
 
 
+def _version_order(version):
+    return tuple(map(int, version.split(".")))
+
+
+def _atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    try:
+        temp.write(content)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temp.close()
+        os.replace(temp.name, path)
+    except OSError:
+        try:
+            os.unlink(temp.name)
+        except OSError:
+            pass
+        raise
+
+
+def _same_file(path_a, path_b):
+    # Existing files: compare via inode so symlinks and hard links are caught.
+    try:
+        if path_a.exists() and path_b.exists():
+            return path_a.samefile(path_b)
+    except OSError:
+        pass
+    # Missing targets: compare resolved paths to catch textual aliases.
+    try:
+        return path_a.resolve() == path_b.resolve()
+    except OSError:
+        return os.path.abspath(path_a) == os.path.abspath(path_b)
+
+
 class ReleaseDesk:
     def __init__(self, path):
         self.path = Path(path)
@@ -57,12 +92,41 @@ class ReleaseDesk:
             else:
                 records[version] = changes
                 imported.append(version)
-        order = lambda version: tuple(map(int, version.split(".")))
+        order = _version_order
         imported.sort(key=order)
         skipped.sort(key=order)
         if imported:
             self._write_store(records)
         return {"imported": imported, "skipped": skipped}
+
+    def export_releases(self, versions=None):
+        if versions is None:
+            selected = None
+        else:
+            if not isinstance(versions, list) or not all(isinstance(version, str) for version in versions):
+                raise ValueError("versions must be None or a list of version strings")
+            selected = []
+            for version in versions:
+                if not re.fullmatch(VERSION_PATTERN, version):
+                    raise ValueError("version must have three nonnegative numeric components")
+                if version not in selected:
+                    selected.append(version)
+        # The whole store is validated regardless of the requested selection.
+        records = self._read_store()
+        if selected is None:
+            chosen = list(records)
+        else:
+            for version in selected:
+                if version not in records:
+                    raise ValueError("unknown release")
+            chosen = selected
+        exported = {}
+        for version in sorted(chosen, key=_version_order):
+            exported[version] = [
+                {"category": change["category"], "text": change["text"].strip()}
+                for change in records[version]
+            ]
+        return exported
 
     @staticmethod
     def _clean_changes(changes):
@@ -113,21 +177,8 @@ class ReleaseDesk:
         return records
 
     def _write_store(self, records):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         content = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
-        temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False)
-        try:
-            temp.write(content)
-            temp.flush()
-            os.fsync(temp.fileno())
-            temp.close()
-            os.replace(temp.name, self.path)
-        except OSError:
-            try:
-                os.unlink(temp.name)
-            except OSError:
-                pass
-            raise
+        _atomic_write(self.path, content)
 
     def versions(self):
         records = self._read_store()
@@ -188,6 +239,9 @@ def main():
     commands.add_parser("notes").add_argument("version")
     commands.add_parser("versions")
     commands.add_parser("import").add_argument("file")
+    export = commands.add_parser("export")
+    export.add_argument("--version", action="append", dest="versions")
+    export.add_argument("--output")
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
@@ -207,6 +261,15 @@ def main():
                 result = desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
+            elif args.command == "export":
+                result = desk.export_releases(args.versions)
+                if args.output:
+                    output_path = Path(args.output)
+                    if _same_file(desk.path, output_path):
+                        raise ValueError("output must not be the same file as the store")
+                    content = json.dumps(result, ensure_ascii=False) + "\n"
+                    _atomic_write(output_path, content)
+                    result = {"exported": list(result)}
             else:
                 result = desk.versions()
             print(json.dumps(result, ensure_ascii=False))
