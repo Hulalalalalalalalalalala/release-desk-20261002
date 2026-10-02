@@ -105,6 +105,59 @@ def _diff_config_values(base, target, path, added, removed, changed):
         changed.append({"path": path, "before": base, "after": target})
 
 
+def _present_equal(present_a, value_a, present_b, value_b):
+    # Equality with presence: a missing field only equals another missing
+    # field, never null or any present value.
+    if not present_a or not present_b:
+        return not present_a and not present_b
+    return _json_values_equal(value_a, value_b)
+
+
+def _preview_side(present, value):
+    side = {"present": present}
+    if present:
+        side["value"] = value
+    return side
+
+
+def _preview_config_values(base, target, current, path, conflicts):
+    # Three-way merge of one object level. All three values are objects;
+    # arrays, scalars and whole added/removed subobjects never reach here.
+    preview = {}
+    for key in base.keys() | target.keys() | current.keys():
+        child_path = path + "/" + _escape_pointer_token(key)
+        bp, tp, cp = key in base, key in target, key in current
+        bv, tv, cv = base.get(key), target.get(key), current.get(key)
+        if _present_equal(bp, bv, tp, tv):
+            # The plan leaves the field untouched: keep the current state.
+            if cp:
+                preview[key] = cv
+        elif _present_equal(cp, cv, tp, tv):
+            # The current state already matches the target: keep it.
+            if cp:
+                preview[key] = cv
+        elif _present_equal(cp, cv, bp, bv):
+            # The current state matches the base: adopt the target,
+            # including whole-field additions and deletions.
+            if tp:
+                preview[key] = tv
+        elif bp and tp and cp and isinstance(bv, dict) and isinstance(tv, dict) and isinstance(cv, dict):
+            # All three sides changed the same field, each to another object:
+            # preview the subfields independently.
+            preview[key] = _preview_config_values(bv, tv, cv, child_path, conflicts)
+        else:
+            # Divergent whole values (arrays, type changes, added/removed
+            # subobjects, changed fields the current side lacks): one conflict
+            # at this path, keeping the current presence state and value.
+            conflicts.append({"path": child_path,
+                              "base": _preview_side(bp, bv),
+                              "target": _preview_side(tp, tv),
+                              "current": _preview_side(cp, cv)})
+            if cp:
+                preview[key] = cv
+    return preview
+
+
 def _version_order(version):
     return tuple(map(int, version.split(".")))
 
@@ -570,6 +623,29 @@ class ReleaseDesk:
         return {"baseVersion": base_version, "targetVersion": target_version,
                 "added": added, "removed": removed, "changed": changed}
 
+    def preview_config(self, base_version, target_version, base_config, target_config, current_config):
+        # Read-only three-way preview of applying the base->target plan onto
+        # the current configuration. Nothing is stored and the configurations
+        # are never inferred from change entries.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        _validated_config(base_config)
+        _validated_config(target_config)
+        _validated_config(current_config)
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        conflicts = []
+        preview = _preview_config_values(base_config, target_config, current_config, "", conflicts)
+        # Paths sort by Unicode code point, not by locale.
+        conflicts.sort(key=lambda entry: entry["path"])
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "canApply": not conflicts, "config": preview, "conflicts": conflicts}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -594,6 +670,12 @@ def main():
     diff_config.add_argument("target_version")
     diff_config.add_argument("base_config")
     diff_config.add_argument("target_config")
+    preview_config = commands.add_parser("preview-config")
+    preview_config.add_argument("base_version")
+    preview_config.add_argument("target_version")
+    preview_config.add_argument("base_config")
+    preview_config.add_argument("target_config")
+    preview_config.add_argument("current_config")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -635,6 +717,21 @@ def main():
                     raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
                 result = desk.diff_config(args.base_version, args.target_version,
                                           base_payload, target_payload)
+            elif args.command == "preview-config":
+                try:
+                    base_payload = _loads_unique(Path(args.base_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_payload = _loads_unique(Path(args.target_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    current_payload = _loads_unique(Path(args.current_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
+                result = desk.preview_config(args.base_version, args.target_version,
+                                             base_payload, target_payload, current_payload)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
