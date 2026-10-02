@@ -2444,6 +2444,134 @@ class ConfigResolveTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.resolve(base, target, current, {path: "target"})
 
+    def test_custom_value_confirms_new_scalar(self):
+        # The documented example: 80 vs 8080 vs 9000, confirm 9001, keep timeout.
+        result = self.resolve(
+            {"port": 80, "timeout": 30}, {"port": 8080, "timeout": 30},
+            {"port": 9000, "timeout": 60},
+            {"/port": {"present": True, "value": 9001}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9001, "timeout": 60})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+        self.assertEqual(result["conflicts"], [])
+
+    def test_custom_value_equal_to_a_side_is_still_handled_custom(self):
+        for value in (8080, 9000):
+            result = self.resolve({"port": 80}, {"port": 8080}, {"port": 9000},
+                                  {"/port": {"present": True, "value": value}})
+            self.assertEqual(result["config"], {"port": value})
+            self.assertTrue(result["canApply"])
+            self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+
+    def test_custom_value_accepts_all_json_types_including_null(self):
+        cases = (None, True, "x", [1, 2], {"nested": {"k": [True, None]}})
+        for value in cases:
+            result = self.resolve({"a": 1}, {"a": 2}, {"a": 3},
+                                  {"/a": {"present": True, "value": value}})
+            self.assertEqual(result["config"], {"a": value})
+            self.assertEqual(result["resolved"], [{"path": "/a", "choice": "custom"}])
+        null_result = self.resolve({"a": 1}, {"a": 2}, {"a": 3},
+                                   {"/a": {"present": True, "value": None}})
+        self.assertIn("a", null_result["config"])
+        self.assertIsNone(null_result["config"]["a"])
+
+    def test_custom_present_false_deletes_field(self):
+        result = self.resolve({"port": 80, "keep": 1}, {"port": 8080, "keep": 1},
+                              {"port": 9000, "keep": 1},
+                              {"/port": {"present": False}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"keep": 1})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+
+    def test_custom_value_replaces_objects_arrays_and_types_wholesale(self):
+        # A custom object never recursively merges into an existing object.
+        object_result = self.resolve(
+            {"db": {"host": "h", "port": 1}}, {"db": {"host": "h2", "port": 2}},
+            {"db": {"host": "C", "port": 3}},
+            {"/db/host": {"present": True, "value": {"only": "this"}}})
+        self.assertEqual(object_result["config"],
+                         {"db": {"host": {"only": "this"}, "port": 3}})
+        # Whole-object conflict replaced, no subpath merge.
+        whole = self.resolve({"db": {"x": 1}}, {"db": [1]}, {"db": {"x": 2}},
+                             {"/db": {"present": True, "value": {"z": 0}}})
+        self.assertEqual(whole["config"], {"db": {"z": 0}})
+        # Type changes replace outright.
+        typed = self.resolve({"a": 1}, {"a": 2}, {"a": 3},
+                             {"/a": {"present": True, "value": ["now", "array"]}})
+        self.assertEqual(typed["config"], {"a": ["now", "array"]})
+
+    def test_mixed_string_and_custom_decisions(self):
+        result = self.resolve(
+            {"port": 80, "timeout": 30, "note": "x"},
+            {"port": 8080, "timeout": 3, "note": "y"},
+            {"port": 9000, "timeout": 60, "note": "x"},
+            {"/port": "target", "/timeout": {"present": True, "value": 45}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 8080, "timeout": 45, "note": "y"})
+        self.assertEqual(result["resolved"],
+                         [{"path": "/port", "choice": "target"},
+                          {"path": "/timeout", "choice": "custom"}])
+        # A custom choice can be partial just like a string choice.
+        partial = self.resolve(
+            {"port": 80, "timeout": 30}, {"port": 8080, "timeout": 3},
+            {"port": 9000, "timeout": 60},
+            {"/port": {"present": False}})
+        self.assertFalse(partial["canApply"])
+        self.assertEqual(partial["config"], {"timeout": 60})
+        self.assertEqual([entry["path"] for entry in partial["conflicts"]], ["/timeout"])
+
+    def test_custom_path_must_be_exact_conflict_path(self):
+        base, target, current = {"db": {"port": 1}}, {"db": [1]}, {"db": {"port": 2}}
+        custom = {"present": True, "value": 1}
+        with self.assertRaises(ValueError):
+            self.resolve(base, target, current, {"/db/port": custom})
+        with self.assertRaises(ValueError):
+            self.resolve({"a": 1}, {"a": 2}, {"a": 3}, {"/b": custom})
+        with self.assertRaises(ValueError):
+            self.resolve({"a": 1}, {"a": 2}, {"a": 3}, {"": custom})
+
+    def test_invalid_custom_decision_objects(self):
+        base, target, current = {"a": 1}, {"a": 2}, {"a": 3}
+        invalid_objects = (
+            {},
+            {"value": 1},
+            {"present": True},
+            {"present": False, "value": 1},
+            {"present": 1},
+            {"present": 0},
+            {"present": "true"},
+            {"present": None},
+            {"present": True, "value": 1, "extra": 2},
+            {"present": False, "extra": 2},
+            {"present": True, "value": float("nan")},
+            {"present": True, "value": float("inf")},
+            {"present": True, "value": object()},
+            {"present": True, "value": {1: 2}},
+            {"present": True, "value": [float("-inf")]},
+            {"present": True, "value": {"k": {"n": object()}}},
+        )
+        for choice in invalid_objects:
+            with self.assertRaises(ValueError, msg=choice):
+                self.resolve(base, target, current, {"/a": choice})
+        cycle = {"x": 1}
+        cycle["self"] = cycle
+        with self.assertRaises(ValueError):
+            self.resolve(base, target, current, {"/a": {"present": True, "value": cycle}})
+
+    def test_custom_decisions_inputs_untouched_and_result_detached(self):
+        base, target, current = {"a": 1}, {"a": 2}, {"a": 3}
+        value = {"nested": [1, 2]}
+        decisions = {"/a": {"present": True, "value": value}}
+        snapshot = json.loads(json.dumps(decisions))
+        result = self.resolve(base, target, current, decisions)
+        self.assertEqual(decisions, snapshot)
+        # Mutating the returned config never reaches the decisions object.
+        result["config"]["a"]["nested"].append(3)
+        self.assertEqual(decisions["/a"]["value"], {"nested": [1, 2]})
+        # Mutating the input after the call never reaches the result.
+        decisions["/a"]["value"]["nested"].append(99)
+        self.assertEqual(result["config"]["a"]["nested"], [1, 2, 3])
+
     def test_versions_store_and_configs_validated_like_preview(self):
         good = {"a": 1}
         for base_version, target_version in ((None, "1.0.0"), ("v1", "1.0.0"),
@@ -2525,6 +2653,32 @@ class ConfigResolveTests(unittest.TestCase):
                                capture_output=True, text=True)
         self.assertEqual(empty.returncode, 0, empty.stderr)
         self.assertEqual(json.loads(empty.stdout)["resolved"], [])
+        # A custom decision confirms a new value and keeps independent edits.
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 30}), encoding="utf-8")
+        decisions_file.write_text(json.dumps({"/port": {"present": True, "value": 9001}}),
+                                  encoding="utf-8")
+        custom = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                          str(base_file), str(target_file),
+                                          str(current_file), str(decisions_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.assertEqual(json.loads(custom.stdout), {
+            "baseVersion": "1.0.0", "targetVersion": "2.0.0", "canApply": True,
+            "config": {"port": 9001, "timeout": 60},
+            "conflicts": [], "resolved": [{"path": "/port", "choice": "custom"}]})
+        # Strings and custom objects may be mixed in the same decisions file;
+        # present false deletes the field, and the exit stays 0 with a conflict.
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 3}), encoding="utf-8")
+        decisions_file.write_text(json.dumps({"/port": {"present": False}}), encoding="utf-8")
+        deleted = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                           str(base_file), str(target_file),
+                                           str(current_file), str(decisions_file)],
+                                 capture_output=True, text=True)
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        deleted_payload = json.loads(deleted.stdout)
+        self.assertFalse(deleted_payload["canApply"])
+        self.assertEqual(deleted_payload["config"], {"timeout": 60})
+        self.assertEqual(deleted_payload["resolved"], [{"path": "/port", "choice": "custom"}])
 
     def test_cli_resolve_config_errors(self):
         prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
@@ -2542,6 +2696,14 @@ class ConfigResolveTests(unittest.TestCase):
             (json.dumps(None),),
             (json.dumps({"/a": "yes"}),),
             (json.dumps({"/b": "target"}),),
+            (json.dumps({"/a": {"present": True}}),),
+            (json.dumps({"/a": {"present": False, "value": 1}}),),
+            (json.dumps({"/a": {"present": "true", "value": 1}}),),
+            (json.dumps({"/a": {"present": 1, "value": 1}}),),
+            (json.dumps({"/a": {"present": True, "value": 1, "extra": 2}}),),
+            (json.dumps({"/a": {"present": True, "value": 1e999}}),),
+            ('{"/a": {"present": true, "value": {"x": 1, "x": 2}}}',),
+            ('{"/a": {"present": true, "value": [1]}, "/a": "current"}',),
         ]
         base_file.write_text(good, encoding="utf-8")
         target_file.write_text(json.dumps({"a": 2}), encoding="utf-8")

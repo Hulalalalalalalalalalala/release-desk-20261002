@@ -31,12 +31,12 @@ def _loads_unique(raw):
     return json.loads(raw, object_pairs_hook=_unique_object)
 
 
-def _validated_config(value, seen=None):
-    # Validate a user-supplied JSON configuration before comparison: an object
-    # root, string keys, JSON values only, finite numbers, no cycles. Objects
-    # and arrays are traversed read-only; values are never replaced.
+def _validate_json_value(value, seen=None, *, require_object=False):
+    # Validate a user-supplied JSON value read-only: string keys, JSON values
+    # only, finite numbers, no cycles. Objects and arrays are traversed without
+    # replacing anything; require_object additionally demands an object root.
     if seen is None:
-        if not isinstance(value, dict):
+        if require_object and not isinstance(value, dict):
             raise ValueError("configuration must be a JSON object")
         seen = set()
     if isinstance(value, dict):
@@ -46,14 +46,14 @@ def _validated_config(value, seen=None):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("configuration object keys must be strings")
-            _validated_config(item, seen)
+            _validate_json_value(item, seen)
         seen.remove(id(value))
     elif isinstance(value, list):
         if id(value) in seen:
             raise ValueError("configuration contains a circular reference")
         seen.add(id(value))
         for item in value:
-            _validated_config(item, seen)
+            _validate_json_value(item, seen)
         seen.remove(id(value))
     elif isinstance(value, bool) or value is None or isinstance(value, (str, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
@@ -61,6 +61,53 @@ def _validated_config(value, seen=None):
     else:
         raise ValueError("configuration values must be JSON values")
     return value
+
+
+def _validated_config(value, seen=None):
+    # Validate a user-supplied JSON configuration before comparison: an object
+    # root, string keys, JSON values only, finite numbers, no cycles.
+    if seen is not None:
+        return _validate_json_value(value, seen)
+    return _validate_json_value(value, require_object=True)
+
+
+def _validated_custom_choice(choice):
+    # Validate one custom decision: a strict {"present": bool} object, with a
+    # required "value" when present and no other fields. The value is any JSON
+    # value (null included) and is traversed read-only.
+    present = choice.get("present")
+    if not isinstance(present, bool):
+        raise ValueError("custom decision present must be a boolean")
+    fields = set(choice)
+    if present:
+        if fields != {"present", "value"}:
+            raise ValueError("a present custom decision requires only present and value")
+        _validate_json_value(choice["value"])
+    else:
+        if fields != {"present"}:
+            raise ValueError("an absent custom decision requires only present")
+    return choice
+
+
+def _validated_decisions(decisions):
+    # Validate the decisions map before anything is compared: string keys and
+    # either a legal side name or a well-formed custom choice object. Path
+    # membership against actual conflict paths is checked afterwards.
+    if not isinstance(decisions, dict):
+        raise ValueError("decisions must be a JSON object")
+    normalized = {}
+    for path, choice in decisions.items():
+        if not isinstance(path, str):
+            raise ValueError("decision keys must be strings")
+        if isinstance(choice, str):
+            if choice not in ("target", "current"):
+                raise ValueError("decision choice must be target, current or a custom decision object")
+            normalized[path] = choice
+        elif isinstance(choice, dict):
+            normalized[path] = _validated_custom_choice(choice)
+        else:
+            raise ValueError("decision choice must be target, current or a custom decision object")
+    return normalized
 
 
 def _json_values_equal(base, target):
@@ -165,8 +212,10 @@ def _version_order(version):
 
 def _resolve_config_values(base, target, current, path, choices, resolved):
     # Three-way merge mirroring _preview_config_values, applying confirmed
-    # whole-field choices at conflict paths. All values are traversed
-    # read-only; the returned object is built from deep copies.
+    # choices at conflict paths. choices maps exact conflict paths to either a
+    # side name ("target"/"current") or a {"present", "value"?} object. All
+    # values are traversed read-only; the returned object is built from deep
+    # copies.
     resolved_config = {}
     for key in base.keys() | target.keys() | current.keys():
         child_path = path + "/" + _escape_pointer_token(key)
@@ -191,9 +240,17 @@ def _resolve_config_values(base, target, current, path, choices, resolved):
                 if cp:
                     resolved_config[key] = copy.deepcopy(cv)
             else:
-                side = tv if choice == "target" else cv
-                present = tp if choice == "target" else cp
-                resolved.append({"path": child_path, "choice": choice})
+                if isinstance(choice, str):
+                    present = tp if choice == "target" else cp
+                    side = tv if choice == "target" else cv
+                    recorded = choice
+                else:
+                    # A custom choice replaces the whole field, even when the
+                    # new value equals one of the sides or changes its type.
+                    present = choice["present"]
+                    side = choice.get("value")
+                    recorded = "custom"
+                resolved.append({"path": child_path, "choice": recorded})
                 if present:
                     # A null side value is kept as a value, not a missing field.
                     resolved_config[key] = copy.deepcopy(side)
@@ -688,20 +745,15 @@ class ReleaseDesk:
                        current_config, decisions):
         # Read-only three-way resolution with per-path conflict choices. The
         # decisions map original preview_config conflict paths verbatim to
-        # "target" or "current"; nothing is stored or inferred from entries.
+        # "target", "current" or a custom {"present", "value"?} decision;
+        # nothing is stored or inferred from entries.
         for version in (base_version, target_version):
             if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
                 raise ValueError("version must have three nonnegative numeric components")
         _validated_config(base_config)
         _validated_config(target_config)
         _validated_config(current_config)
-        if not isinstance(decisions, dict):
-            raise ValueError("decisions must be a JSON object")
-        for path, choice in decisions.items():
-            if not isinstance(path, str):
-                raise ValueError("decision keys must be strings")
-            if choice not in ("target", "current"):
-                raise ValueError("decision choice must be target or current")
+        choices = _validated_decisions(decisions)
         # The whole store is validated before either version is looked up.
         records = self._read_store()
         if base_version not in records:
@@ -713,12 +765,12 @@ class ReleaseDesk:
         conflict_paths = {entry["path"] for entry in conflicts}
         # Keys match the original conflict paths verbatim, using the same JSON
         # Pointer escaping: no trimming, normalization or subpath selection.
-        for path in decisions:
+        for path in choices:
             if path not in conflict_paths:
                 raise ValueError("decision path is not a conflict path")
         resolved = []
         config = _resolve_config_values(
-            base_config, target_config, current_config, "", decisions, resolved)
+            base_config, target_config, current_config, "", choices, resolved)
         chosen_paths = {entry["path"] for entry in resolved}
         remaining = [entry for entry in conflicts if entry["path"] not in chosen_paths]
         # Paths sort by Unicode code point, not by locale.
