@@ -4362,5 +4362,321 @@ class ReleaseRecordTests(unittest.TestCase):
         self.assertFalse(target.parent.exists())
 
 
+class PreviewMergeChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+
+    @staticmethod
+    def payload(items, version="1.2.0"):
+        return {"version": version, "items": items}
+
+    def base_payload(self):
+        return self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+
+    def test_clean_merge_combines_both_sides(self):
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+            {"id": "e", "text": "Epsilon", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+        result = self.desk.preview_merge_checklist(
+            "1.2.0", self.base_payload(), incoming, current)
+        self.assertEqual(set(result), {"version", "canMerge", "ready", "items", "conflicts"})
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertTrue(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["conflicts"], [])
+        # Current-side order first, then incoming-only items in incoming order.
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+            {"id": "e", "text": "Epsilon", "required": False, "status": "pending"}])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_independent_current_edits_and_deletions_survive(self):
+        # Incoming matches the base everywhere: every current edit is kept.
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "own", "text": "Own", "required": False, "status": "blocked"},
+        ])
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "gone", "text": "Gone", "required": False, "status": "pending"},
+        ])
+        result = self.desk.preview_merge_checklist("1.2.0", base, base, current)
+        self.assertTrue(result["canMerge"])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "own", "text": "Own", "required": False, "status": "blocked"}])
+        # Current matching the incoming side is kept even when it differs from base.
+        again = self.desk.preview_merge_checklist("1.2.0", base, current, current)
+        self.assertEqual(again["items"], result["items"])
+
+    def test_conflict_keeps_current_and_reports_whole_items(self):
+        base = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+            {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        result = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertFalse(result["canMerge"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["items"], [
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"}])
+        self.assertEqual(result["conflicts"], [
+            {"id": "x",
+             "base": {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+             "incoming": {"id": "x", "text": "Xray", "required": True, "status": "done"},
+             "current": {"id": "x", "text": "Xray", "required": True, "status": "blocked"}},
+            {"id": "y",
+             "base": {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+             "incoming": None,
+             "current": {"id": "y", "text": "Yank", "required": False, "status": "done"}}])
+
+    def test_conflicts_sorted_by_id_code_point(self):
+        base = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "pending"},
+            {"id": "A", "text": "Ay", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "done"},
+            {"id": "A", "text": "Ay", "required": False, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "blocked"},
+            {"id": "A", "text": "Ay", "required": False, "status": "blocked"},
+        ])
+        result = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertEqual([entry["id"] for entry in result["conflicts"]], ["A", "b"])
+
+    def test_extra_fields_ignored_in_comparison(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending", "note": 1},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending", "note": 2},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        result = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertTrue(result["canMerge"])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"}])
+
+    def test_result_validation_empty_or_no_required(self):
+        # Every current item is adopted away or lost to a conflict and no
+        # incoming item enters: the preview would be empty.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        # Only optional items survive a clean merge: no required item remains.
+        steady_incoming = self.payload([
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+        ])
+        demoted_current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": False, "status": "pending"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.preview_merge_checklist("1.2.0", base, steady_incoming, demoted_current)
+        # The same rule applies when the preview also reports conflicts.
+        incoming_with_add = self.payload([
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+            {"id": "o", "text": "Opt", "required": False, "status": "pending"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.preview_merge_checklist("1.2.0", base, incoming_with_add, current)
+
+    def test_validation_errors(self):
+        valid = self.base_payload()
+        for version in (None, "v1", "1.0", "9.9.9"):
+            with self.assertRaises(ValueError):
+                self.desk.preview_merge_checklist(version, valid, valid, valid)
+        # Declared versions must match the queried version in every input.
+        mismatched = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ], version="1.0.0")
+        for position in range(3):
+            inputs = [valid, valid, valid]
+            inputs[position] = mismatched
+            with self.assertRaises(ValueError):
+                self.desk.preview_merge_checklist("1.2.0", *inputs)
+        # Every input must satisfy the checklist rules on its own.
+        invalid = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "weird"},
+        ])
+        for position in range(3):
+            inputs = [valid, valid, valid]
+            inputs[position] = invalid
+            with self.assertRaises(ValueError):
+                self.desk.preview_merge_checklist("1.2.0", *inputs)
+        # An invalid store is rejected, and a missing store reports unknown.
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.preview_merge_checklist("1.2.0", valid, valid, valid)
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        with self.assertRaises(ValueError):
+            desk.preview_merge_checklist("1.2.0", valid, valid, valid)
+
+    def test_inputs_untouched_and_result_detached(self):
+        base = self.base_payload()
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+        snapshot = json.loads(json.dumps([base, incoming, current]))
+        store_before = self.path.read_bytes()
+        result = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertFalse(result["canMerge"])
+        self.assertEqual([base, incoming, current], snapshot)
+        result["items"][0]["status"] = "done"
+        result["conflicts"][0]["current"]["status"] = "done"
+        self.assertEqual([base, incoming, current], snapshot)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "merge-checklist", *extra]
+
+    def write_files(self, base, incoming, current):
+        paths = []
+        for name, payload in (("base.json", base), ("incoming.json", incoming),
+                              ("current.json", current)):
+            path = Path(self.temp.name) / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def test_cli_merge_checklist_success_with_conflicts(self):
+        base, incoming, current = self.write_files(
+            self.payload([
+                {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+            ]),
+            self.payload([
+                {"id": "x", "text": "Xray", "required": True, "status": "done"},
+            ]),
+            self.payload([
+                {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            ]))
+        before = [path.read_bytes() for path in (self.path, base, incoming, current)]
+        result = subprocess.run(
+            self.command("1.2.0", str(base), str(incoming), str(current)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report), {"version", "canMerge", "ready", "items", "conflicts"})
+        self.assertFalse(report["canMerge"])
+        self.assertEqual(len(report["conflicts"]), 1)
+        self.assertEqual([path.read_bytes() for path in (self.path, base, incoming, current)],
+                         before)
+
+    def test_cli_merge_checklist_clean_merge(self):
+        base, incoming, current = self.write_files(
+            self.base_payload(),
+            self.payload([
+                {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+                {"id": "b", "text": "Beta", "required": True, "status": "done"},
+                {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+                {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+            ]),
+            self.base_payload())
+        result = subprocess.run(
+            self.command("1.2.0", str(base), str(incoming), str(current)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["canMerge"])
+        self.assertEqual(report["conflicts"], [])
+        self.assertEqual([item["status"] for item in report["items"]],
+                         ["pending", "done", "done", "pending"])
+
+    def test_cli_merge_checklist_errors(self):
+        base, incoming, current = self.write_files(
+            self.base_payload(), self.base_payload(), self.base_payload())
+        before = [path.read_bytes() for path in (self.path, base, incoming, current)]
+        # Non-UTF-8 bytes, JSON syntax errors and duplicate keys at any level.
+        for raw in (b"\xff\xfe", b"{not json",
+                    b'{"version": "1.2.0", "items": [{"id": "a", "id": "b",'
+                    b' "text": "T", "required": true, "status": "done"}]}'):
+            incoming.write_bytes(raw)
+            failed = subprocess.run(
+                self.command("1.2.0", str(base), str(incoming), str(current)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        incoming.write_text(json.dumps(self.base_payload()), encoding="utf-8")
+        # Bad and unknown versions and a declared-version mismatch.
+        mismatched = Path(self.temp.name) / "mismatched.json"
+        mismatched.write_text(json.dumps(self.payload(
+            [{"id": "a", "text": "Alpha", "required": True, "status": "done"}],
+            version="1.0.0")), encoding="utf-8")
+        for arguments in (self.command("v1", str(base), str(incoming), str(current)),
+                          self.command("9.9.9", str(base), str(incoming), str(current)),
+                          self.command("1.2.0", str(mismatched), str(incoming), str(current)),
+                          self.command("1.2.0", str(base), str(mismatched), str(current)),
+                          self.command("1.2.0", str(base), str(incoming), str(mismatched))):
+            failed = subprocess.run(arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        # A missing input file fails without creating anything.
+        missing = Path(self.temp.name) / "missing.json"
+        failed = subprocess.run(
+            self.command("1.2.0", str(missing), str(incoming), str(current)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        # Nothing was modified and no file or directory was created.
+        self.assertEqual([path.read_bytes() for path in (self.path, base, incoming, current)],
+                         before)
+        self.assertEqual({path.name for path in Path(self.temp.name).iterdir()},
+                         {"releases.json", "base.json", "incoming.json",
+                          "current.json", "mismatched.json"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -694,6 +694,72 @@ class ReleaseDesk:
                 "items": resulting, "updated": updated, "ready": ready,
                 "conflicts": conflicts}
 
+    def preview_merge_checklist(self, version, base, incoming, current):
+        # Read-only three-way merge preview of same-version checklists: items
+        # are matched by normalized id and compared as whole normalized items
+        # (id, text, required, status; extra fields ignored, missing differing
+        # from any present item). An incoming side equal to the base or to the
+        # current side keeps the current side; otherwise a current side equal
+        # to the base adopts the incoming side; anything else is one whole-item
+        # conflict that keeps the current presence state and content.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        base_items = self._validated_checklist(base, version)
+        incoming_items = self._validated_checklist(incoming, version)
+        current_items = self._validated_checklist(current, version)
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        base_by_id = {item["id"]: item for item in base_items}
+        incoming_by_id = {item["id"]: item for item in incoming_items}
+        current_by_id = {item["id"]: item for item in current_items}
+        merged, conflicts = {}, []
+        for item_id in base_by_id.keys() | incoming_by_id.keys() | current_by_id.keys():
+            base_item = base_by_id.get(item_id)
+            incoming_item = incoming_by_id.get(item_id)
+            current_item = current_by_id.get(item_id)
+            if incoming_item == base_item or current_item == incoming_item:
+                # The plan changes nothing, or the current side already
+                # matches the incoming side: keep the current side.
+                merged[item_id] = current_item
+            elif current_item == base_item:
+                # The current side matches the base: adopt the incoming side,
+                # including whole-item additions and deletions.
+                merged[item_id] = incoming_item
+            else:
+                # Divergent whole items: one conflict per id, keeping the
+                # current presence state and content.
+                conflicts.append({"id": item_id,
+                                  "base": dict(base_item) if base_item is not None else None,
+                                  "incoming": dict(incoming_item) if incoming_item is not None else None,
+                                  "current": dict(current_item) if current_item is not None else None})
+                merged[item_id] = current_item
+        # Items keep the current-side order, then preview items the current
+        # side lacks follow in incoming-side order.
+        items = []
+        for item in current_items:
+            kept = merged[item["id"]]
+            if kept is not None:
+                items.append(dict(kept))
+        for item in incoming_items:
+            item_id = item["id"]
+            if item_id not in current_by_id:
+                kept = merged[item_id]
+                if kept is not None:
+                    items.append(dict(kept))
+        # The merged preview must stay a legal checklist, conflicts or not.
+        if not items:
+            raise ValueError("checklist requires at least one item")
+        if not any(item["required"] for item in items):
+            raise ValueError("checklist requires at least one required item")
+        ready = all(item["status"] == "done" for item in items if item["required"])
+        # Ids sort by Unicode code point, not by locale.
+        conflicts.sort(key=lambda entry: entry["id"])
+        return {"version": version, "canMerge": not conflicts, "ready": ready,
+                "items": items, "conflicts": conflicts}
+
     def _prepare_checklist_update(self, version, updates, checklist_path):
         # Shared validation and reading for update_checklist and its preview:
         # version, updates batch, whole store, registration, target path rules
@@ -1182,6 +1248,11 @@ def main():
     update_checklist.add_argument("updates")
     update_checklist.add_argument("checklist")
     update_checklist.add_argument("--dry-run", action="store_true", dest="dry_run")
+    merge_checklist = commands.add_parser("merge-checklist")
+    merge_checklist.add_argument("version")
+    merge_checklist.add_argument("base")
+    merge_checklist.add_argument("incoming")
+    merge_checklist.add_argument("current")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1359,6 +1430,21 @@ def main():
                 else:
                     result = desk.update_checklist(
                         args.version, updates_payload, checklist_path)
+            elif args.command == "merge-checklist":
+                try:
+                    base_payload = _loads_unique(Path(args.base).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    incoming_payload = _loads_unique(Path(args.incoming).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("incoming checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    current_payload = _loads_unique(Path(args.current).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("current checklist file must contain UTF-8 encoded JSON") from exc
+                result = desk.preview_merge_checklist(args.version, base_payload,
+                                                      incoming_payload, current_payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
