@@ -631,17 +631,58 @@ class ReleaseDesk:
                 "retained": retained, "reset": reset, "added": added_ids,
                 "removed": removed_ids}
 
-    def update_checklist(self, version, updates, checklist_path):
-        # Batch-update the statuses of a local checklist file after confirming
-        # every expected status still matches the read bytes: one mismatch
-        # rejects the whole batch. Only when at least one status changes is the
-        # target replaced wholesale with UTF-8 JSON ending in a newline;
-        # otherwise its bytes and modification time are left untouched.
+    def preview_update_checklist(self, version, updates, checklist_path):
+        # Read-only dry run of update_checklist: the same version, store,
+        # checklist, update-entry validation and trimmed id matching, but
+        # unknown ids and expected-status mismatches are reported as conflicts
+        # in updates-array order instead of raised, and nothing is written.
+        items, normalized_updates = self._prepared_checklist_update(
+            version, updates, checklist_path)
+        status_by_id = {item["id"]: item["status"] for item in items}
+        targets = {item_id: status for item_id, _expected, status in normalized_updates}
+        # Ids match case-sensitively after trimming, without Unicode
+        # normalization; every expected status is checked, including entries
+        # whose target status would not change anything.
+        conflicts = []
+        for item_id, expected, status in normalized_updates:
+            actual = status_by_id.get(item_id)
+            if actual is None:
+                conflicts.append({"id": item_id, "expected": expected, "actual": None,
+                                  "status": status, "reason": "unknown-id"})
+            elif actual != expected:
+                conflicts.append({"id": item_id, "expected": expected, "actual": actual,
+                                  "status": status, "reason": "status-mismatch"})
+        normalized = [dict(item) for item in items]
+        ready = all(item["status"] == "done" for item in normalized if item["required"])
+        if conflicts:
+            # Any conflict rejects the whole batch: the original checklist is
+            # reported unchanged, with no partial update.
+            return {"version": version, "canUpdate": False, "changed": False,
+                    "items": normalized, "updated": [], "ready": ready,
+                    "conflicts": conflicts}
+        updated, resulting = [], []
+        for item in items:
+            item_id = item["id"]
+            if item_id in targets and targets[item_id] != item["status"]:
+                updated.append(item_id)
+                resulting.append({"id": item["id"], "text": item["text"],
+                                  "required": item["required"], "status": targets[item_id]})
+            else:
+                resulting.append(dict(item))
+        return {"version": version, "canUpdate": True, "changed": bool(updated),
+                "items": resulting, "updated": updated,
+                "ready": all(item["status"] == "done" for item in resulting if item["required"]),
+                "conflicts": []}
+
+    def _prepared_checklist_update(self, version, updates, checklist_path):
+        # Shared validation and read path of update_checklist and its preview:
+        # version and update batch first, then the whole store (a missing store
+        # is treated as empty and then reports the version as unknown), the
+        # symlink/store same-file target checks, and the checklist bytes parsed
+        # as unique-key UTF-8 JSON and validated against the queried version.
         if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
             raise ValueError("version must have three nonnegative numeric components")
         normalized_updates = self._validated_updates(updates)
-        # The whole store is validated before the version is looked up; a
-        # missing store is treated as empty and then reports it as unknown.
         records = self._read_store()
         if version not in records:
             raise ValueError("unknown release")
@@ -662,10 +703,17 @@ class ReleaseDesk:
         except json.JSONDecodeError as exc:
             raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
         items = self._validated_checklist(payload, version)
+        return items, normalized_updates
+
+    def update_checklist(self, version, updates, checklist_path):
+        # Batch-update the statuses of a local checklist file after confirming
+        # every expected status still matches the read bytes: one mismatch
+        # rejects the whole batch. Only when at least one status changes is the
+        # target replaced wholesale with UTF-8 JSON ending in a newline;
+        # otherwise its bytes and modification time are left untouched.
+        items, normalized_updates = self._prepared_checklist_update(
+            version, updates, checklist_path)
         status_by_id = {item["id"]: item["status"] for item in items}
-        # Ids match case-sensitively after trimming, without Unicode
-        # normalization; every expected status is checked, including entries
-        # whose target status would not change anything.
         for item_id, expected, _status in normalized_updates:
             actual = status_by_id.get(item_id)
             if actual is None:
@@ -686,7 +734,7 @@ class ReleaseDesk:
         if changed:
             content = json.dumps({"version": version, "items": resulting},
                                  ensure_ascii=False, indent=2) + "\n"
-            _atomic_write(path, content)
+            _atomic_write(Path(checklist_path), content)
         ready = all(item["status"] == "done" for item in resulting if item["required"])
         return {"version": version, "changed": changed, "items": resulting,
                 "updated": updated, "ready": ready}
@@ -1130,6 +1178,7 @@ def main():
     update_checklist.add_argument("version")
     update_checklist.add_argument("updates")
     update_checklist.add_argument("checklist")
+    update_checklist.add_argument("--dry-run", action="store_true", dest="dry_run")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1301,7 +1350,12 @@ def main():
                 if _same_file(Path(args.updates), checklist_path):
                     raise ValueError(
                         "checklist file must not be the same file as the updates file")
-                result = desk.update_checklist(args.version, updates_payload, checklist_path)
+                if args.dry_run:
+                    result = desk.preview_update_checklist(
+                        args.version, updates_payload, checklist_path)
+                else:
+                    result = desk.update_checklist(
+                        args.version, updates_payload, checklist_path)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:

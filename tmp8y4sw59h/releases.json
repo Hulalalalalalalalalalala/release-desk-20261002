@@ -1,0 +1,12 @@
+{
+  "1.2.0": [
+    {
+      "category": "Changed",
+      "text": "Sort versions by numeric components"
+    },
+    {
+      "category": "Fixed",
+      "text": "Reject duplicate release versions"
+    }
+  ]
+}

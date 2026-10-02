@@ -1,0 +1,23 @@
+{
+  "version": "1.2.0",
+  "items": [
+    {
+      "id": "docs",
+      "text": "Write notes",
+      "required": true,
+      "status": "done"
+    },
+    {
+      "id": "sign",
+      "text": "Sign build",
+      "required": true,
+      "status": "done"
+    },
+    {
+      "id": "nice",
+      "text": "Polish page",
+      "required": false,
+      "status": "blocked"
+    }
+  ]
+}
