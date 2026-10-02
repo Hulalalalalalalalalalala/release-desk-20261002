@@ -1,6 +1,7 @@
 """Store releases and render change notes grouped by category."""
 import argparse
 import json
+import math
 import os
 import re
 import tempfile
@@ -27,6 +28,81 @@ def _unique_object(pairs):
 
 def _loads_unique(raw):
     return json.loads(raw, object_pairs_hook=_unique_object)
+
+
+def _validated_config(value, seen=None):
+    # Validate a user-supplied JSON configuration before comparison: an object
+    # root, string keys, JSON values only, finite numbers, no cycles. Objects
+    # and arrays are traversed read-only; values are never replaced.
+    if seen is None:
+        if not isinstance(value, dict):
+            raise ValueError("configuration must be a JSON object")
+        seen = set()
+    if isinstance(value, dict):
+        if id(value) in seen:
+            raise ValueError("configuration contains a circular reference")
+        seen.add(id(value))
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("configuration object keys must be strings")
+            _validated_config(item, seen)
+        seen.remove(id(value))
+    elif isinstance(value, list):
+        if id(value) in seen:
+            raise ValueError("configuration contains a circular reference")
+        seen.add(id(value))
+        for item in value:
+            _validated_config(item, seen)
+        seen.remove(id(value))
+    elif isinstance(value, bool) or value is None or isinstance(value, (str, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("configuration numbers must be finite")
+    else:
+        raise ValueError("configuration values must be JSON values")
+    return value
+
+
+def _json_values_equal(base, target):
+    # Recursive JSON equality: object key order is ignored, array order counts.
+    if isinstance(base, bool) or isinstance(target, bool):
+        return type(base) is bool and type(target) is bool and base == target
+    if base is None or target is None:
+        return base is None and target is None
+    if isinstance(base, (int, float)) and isinstance(target, (int, float)):
+        # Numerically equal integers and floats compare equal.
+        return base == target
+    if isinstance(base, str) or isinstance(target, str):
+        return isinstance(base, str) and isinstance(target, str) and base == target
+    if isinstance(base, dict) or isinstance(target, dict):
+        if not (isinstance(base, dict) and isinstance(target, dict)):
+            return False
+        if base.keys() != target.keys():
+            return False
+        return all(_json_values_equal(base[key], target[key]) for key in base)
+    if isinstance(base, list) or isinstance(target, list):
+        if not (isinstance(base, list) and isinstance(target, list)):
+            return False
+        return len(base) == len(target) and all(
+            _json_values_equal(base[index], target[index]) for index in range(len(base)))
+    return False
+
+
+def _escape_pointer_token(key):
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def _diff_config_values(base, target, path, added, removed, changed):
+    if isinstance(base, dict) and isinstance(target, dict):
+        for key in target.keys() - base.keys():
+            added.append({"path": path + "/" + _escape_pointer_token(key), "value": target[key]})
+        for key in base.keys() - target.keys():
+            removed.append({"path": path + "/" + _escape_pointer_token(key), "value": base[key]})
+        for key in base.keys() & target.keys():
+            _diff_config_values(
+                base[key], target[key], path + "/" + _escape_pointer_token(key),
+                added, removed, changed)
+    elif not _json_values_equal(base, target):
+        changed.append({"path": path, "before": base, "after": target})
 
 
 def _version_order(version):
@@ -470,6 +546,30 @@ class ReleaseDesk:
             raise ValueError("unknown release")
         return ReleaseDesk._clean_changes(records[version])
 
+    def diff_config(self, base_version, target_version, base_config, target_config):
+        # Read-only structural comparison of two externally supplied
+        # configurations for two registered versions. Nothing is stored and
+        # the configurations are never inferred from change entries.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        _validated_config(base_config)
+        _validated_config(target_config)
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        added, removed, changed = [], [], []
+        _diff_config_values(base_config, target_config, "", added, removed, changed)
+        # Paths sort by Unicode code point, not by locale.
+        added.sort(key=lambda entry: entry["path"])
+        removed.sort(key=lambda entry: entry["path"])
+        changed.sort(key=lambda entry: entry["path"])
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "added": added, "removed": removed, "changed": changed}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -489,6 +589,11 @@ def main():
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
+    diff_config = commands.add_parser("diff-config")
+    diff_config.add_argument("base_version")
+    diff_config.add_argument("target_version")
+    diff_config.add_argument("base_config")
+    diff_config.add_argument("target_config")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -519,6 +624,17 @@ def main():
                 result = desk.preview_import_releases(payload) if args.dry_run else desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
+            elif args.command == "diff-config":
+                try:
+                    base_payload = _loads_unique(Path(args.base_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_payload = _loads_unique(Path(args.target_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
+                result = desk.diff_config(args.base_version, args.target_version,
+                                          base_payload, target_payload)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))

@@ -1740,5 +1740,281 @@ class ReconcileChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ConfigDiffTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.changes = [{"category": "Added", "text": "One"}]
+        self.desk.add("1.0.0", self.changes)
+        self.desk.add("2.0.0", [{"category": "Fixed", "text": "Two"}])
+
+    def test_added_removed_changed_shape(self):
+        base = {"keep": 1, "gone": {"a": 1}, "flag": True, "name": "old"}
+        target = {"keep": 1, "fresh": [1, 2], "flag": False, "name": "new"}
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertEqual(set(result), {"baseVersion", "targetVersion", "added", "removed", "changed"})
+        self.assertEqual(result["baseVersion"], "1.0.0")
+        self.assertEqual(result["targetVersion"], "2.0.0")
+        self.assertEqual(result["added"], [{"path": "/fresh", "value": [1, 2]}])
+        self.assertEqual(result["removed"], [{"path": "/gone", "value": {"a": 1}}])
+        self.assertEqual(result["changed"], [
+            {"path": "/flag", "before": True, "after": False},
+            {"path": "/name", "before": "old", "after": "new"},
+        ])
+
+    def test_nested_objects_recurse_and_whole_subobject_is_one_entry(self):
+        base = {"db": {"host": "local", "pool": {"min": 1, "max": 5}, "keep": [1]}, "only": {"x": 1}}
+        target = {"db": {"host": "remote", "pool": {"min": 2, "max": 5}, "keep": [1]},
+                  "new": {"deep": {"a": [True, None]}}}
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertEqual(result["added"], [{"path": "/new", "value": {"deep": {"a": [True, None]}}}])
+        self.assertEqual(result["removed"], [{"path": "/only", "value": {"x": 1}}])
+        self.assertEqual(result["changed"], [
+            {"path": "/db/host", "before": "local", "after": "remote"},
+            {"path": "/db/pool/min", "before": 1, "after": 2},
+        ])
+
+    def test_object_versus_scalar_compares_whole_value(self):
+        result = self.desk.diff_config("1.0.0", "2.0.0",
+                                      {"a": {"b": 1}, "c": 1}, {"a": 5, "c": {"d": 2}})
+        self.assertEqual(result["changed"], [
+            {"path": "/a", "before": {"b": 1}, "after": 5},
+            {"path": "/c", "before": 1, "after": {"d": 2}},
+        ])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_arrays_not_split_order_counts_and_objects_follow_rules(self):
+        base = {"list": [1, 2], "objs": [{"a": 1}, {"b": 2}], "nested": [[1], [2]]}
+        target = {"list": [2, 1], "objs": [{"a": 1}, {"b": 2}], "nested": [[1], [3]]}
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertEqual(result["changed"], [
+            {"path": "/list", "before": [1, 2], "after": [2, 1]},
+            {"path": "/nested", "before": [[1], [2]], "after": [[1], [3]]},
+        ])
+        # Key order inside array objects is ignored, so /objs is unchanged.
+        reordered = {"objs": [{"a": 1}, {"b": 2, "extra": None}]}
+        base_two = {"objs": [{"a": 1}, {"b": 2, "extra": None}]}
+        self.assertEqual(self.desk.diff_config("1.0.0", "2.0.0", base_two, reordered)["changed"], [])
+
+    def test_scalar_semantics(self):
+        cases = [
+            ({"v": True}, {"v": 1}),
+            ({"v": 1}, {"v": "1"}),
+            ({"v": None}, {"v": False}),
+        ]
+        for base, target in cases:
+            self.assertEqual(len(self.desk.diff_config("1.0.0", "2.0.0", base, target)["changed"]), 1)
+        # null differs from a missing field.
+        result = self.desk.diff_config("1.0.0", "2.0.0", {"a": None}, {})
+        self.assertEqual(result["removed"], [{"path": "/a", "value": None}])
+        result = self.desk.diff_config("1.0.0", "2.0.0", {}, {"a": None})
+        self.assertEqual(result["added"], [{"path": "/a", "value": None}])
+        # Numerically equal integers and floats compare equal.
+        result = self.desk.diff_config("1.0.0", "2.0.0", {"v": 1, "w": 1.5}, {"v": 1.0, "w": 1.50})
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["added"], [])
+        # But genuinely different numbers and strings change.
+        result = self.desk.diff_config("1.0.0", "2.0.0", {"v": 1}, {"v": 1.1})
+        self.assertEqual(len(result["changed"]), 1)
+
+    def test_pointer_escaping_empty_key_and_sorting(self):
+        base = {"": 1, "a~b": 1, "a/b": 1, "z": {"中": 1, "a": 1}, "A": 1}
+        target = {"": 2, "a~b": 2, "a/b": 2, "z": {"中": 2}, "B": 1}
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertEqual(result["added"], [{"path": "/B", "value": 1}])
+        self.assertEqual(result["removed"], [{"path": "/A", "value": 1}, {"path": "/z/a", "value": 1}])
+        self.assertEqual(result["changed"], [
+            {"path": "/", "before": 1, "after": 2},
+            {"path": "/a~0b", "before": 1, "after": 2},
+            {"path": "/a~1b", "before": 1, "after": 2},
+            {"path": "/z/中", "before": 1, "after": 2},
+        ])
+        for group in (result["added"], result["removed"], result["changed"]):
+            paths = [entry["path"] for entry in group]
+            self.assertEqual(paths, sorted(paths))
+
+    def test_case_sensitive_keys_and_key_order_ignored(self):
+        base = {"Key": 1, "order": {"b": 2, "a": 1}}
+        target = {"key": 1, "order": {"a": 1, "b": 2}}
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertEqual(result["added"], [{"path": "/key", "value": 1}])
+        self.assertEqual(result["removed"], [{"path": "/Key", "value": 1}])
+        self.assertEqual(result["changed"], [])
+
+    def test_identical_configs_empty_arrays(self):
+        config = {"a": {"b": [1, True, None, "x"]}, "c": []}
+        result = self.desk.diff_config("1.0.0", "1.0.0", config, dict(config))
+        self.assertEqual(result, {"baseVersion": "1.0.0", "targetVersion": "1.0.0",
+                                  "added": [], "removed": [], "changed": []})
+        empty = self.desk.diff_config("1.0.0", "2.0.0", {}, {})
+        self.assertEqual((empty["added"], empty["removed"], empty["changed"]), ([], [], []))
+
+    def test_same_version_and_reverse_comparison(self):
+        base = {"only_base": 1, "shared": "x"}
+        target = {"only_target": 2, "shared": "y"}
+        same = self.desk.diff_config("1.0.0", "1.0.0", base, target)
+        self.assertEqual(same["added"], [{"path": "/only_target", "value": 2}])
+        self.assertEqual(same["removed"], [{"path": "/only_base", "value": 1}])
+        reverse = self.desk.diff_config("2.0.0", "1.0.0", target, base)
+        self.assertEqual(reverse["added"], [{"path": "/only_base", "value": 1}])
+        self.assertEqual(reverse["removed"], [{"path": "/only_target", "value": 2}])
+        self.assertEqual(reverse["changed"], [{"path": "/shared", "before": "y", "after": "x"}])
+
+    def test_invalid_and_unknown_versions(self):
+        for base, target in ((None, "1.0.0"), ("v1", "1.0.0"), ("1.0", "1.0.0"),
+                             ("1.0.0.0", "1.0.0"), ("01.0.0", "1.0.0")):
+            with self.assertRaises(ValueError):
+                self.desk.diff_config(base, target, {}, {})
+        for base, target in (("9.9.9", "1.0.0"), ("1.0.0", "9.9.9")):
+            with self.assertRaises(ValueError) as caught:
+                self.desk.diff_config(base, target, {}, {})
+            self.assertEqual(str(caught.exception), "unknown release")
+
+    def test_invalid_store_still_rejected(self):
+        raw = json.dumps({"1.0.0": [{"category": "Added", "text": "One"}], "2.0.0": []}).encode()
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.diff_config("1.0.0", "2.0.0", {}, {})
+        raw = b'{"1.0.0": [], "1.0.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.diff_config("1.0.0", "2.0.0", {}, {})
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+
+    def test_missing_store_is_empty_and_unknown(self):
+        missing = Path(self.temp.name) / "no-dir" / "releases.json"
+        desk = ReleaseDesk(missing)
+        with self.assertRaises(ValueError):
+            desk.diff_config("1.0.0", "2.0.0", {}, {})
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+
+    def test_non_object_roots(self):
+        for value in (None, [], "x", 1, True, [{}]):
+            with self.assertRaises(ValueError):
+                self.desk.diff_config("1.0.0", "2.0.0", value, {})
+            with self.assertRaises(ValueError):
+                self.desk.diff_config("1.0.0", "2.0.0", {}, value)
+
+    def test_non_string_keys_non_json_values_and_non_finite(self):
+        cases = [
+            {1: "x"},
+            {"a": object()},
+            {"a": {1, 2}},
+            {"a": (1,)},
+            {"a": float("nan")},
+            {"a": float("inf")},
+            {"a": [float("-inf")]},
+            {"a": [{"b": object()}]},
+        ]
+        for config in cases:
+            with self.assertRaises(ValueError):
+                self.desk.diff_config("1.0.0", "2.0.0", config, {})
+            with self.assertRaises(ValueError):
+                self.desk.diff_config("1.0.0", "2.0.0", {}, config)
+
+    def test_circular_references_rejected(self):
+        cycle = {"a": 1}
+        cycle["self"] = cycle
+        with self.assertRaises(ValueError):
+            self.desk.diff_config("1.0.0", "2.0.0", cycle, {})
+        array_cycle = [1]
+        array_cycle.append(array_cycle)
+        with self.assertRaises(ValueError):
+            self.desk.diff_config("1.0.0", "2.0.0", {"a": array_cycle}, {})
+        # An acyclic shared subobject is fine.
+        shared = {"x": 1}
+        diamond = {"a": shared, "b": {"c": shared}}
+        self.assertEqual(self.desk.diff_config("1.0.0", "2.0.0", diamond, diamond)["changed"], [])
+
+    def test_readonly_inputs_store_and_files_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        base = {"gone": {"a": [1]}, "v": 1}
+        target = {"fresh": {"b": 2}, "v": 2}
+        base_snapshot = json.loads(json.dumps(base))
+        target_snapshot = json.loads(json.dumps(target))
+        result = self.desk.diff_config("1.0.0", "2.0.0", base, target)
+        self.assertTrue(result["added"] and result["removed"] and result["changed"])
+        self.assertEqual(base, base_snapshot)
+        self.assertEqual(target, target_snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_diff_config(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        base_file.write_text(json.dumps({"db": {"host": "local", "pool": 2}, "dropped": True}), encoding="utf-8")
+        target_file.write_text(json.dumps({"db": {"host": "remote", "pool": 2}, "added": None}), encoding="utf-8")
+        result = subprocess.run(prefix + ["diff-config", "1.0.0", "2.0.0",
+                                          str(base_file), str(target_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "baseVersion": "1.0.0",
+            "targetVersion": "2.0.0",
+            "added": [{"path": "/added", "value": None}],
+            "removed": [{"path": "/dropped", "value": True}],
+            "changed": [{"path": "/db/host", "before": "local", "after": "remote"}],
+        })
+        identical = json.dumps({"a": 1})
+        base_file.write_text(identical, encoding="utf-8")
+        target_file.write_text(identical, encoding="utf-8")
+        same = subprocess.run(prefix + ["diff-config", "2.0.0", "2.0.0",
+                                        str(base_file), str(target_file)],
+                              capture_output=True, text=True)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertEqual(json.loads(same.stdout)["changed"], [])
+
+    def test_cli_diff_config_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        good = json.dumps({"a": 1})
+        cases = [
+            ("{not json", good),
+            (b"\xff\xfe", good),
+            (good, '{"a": 1, "a": 2}'),
+            (json.dumps([1, 2]), good),
+            (json.dumps({"a": float("nan")}), good),
+        ]
+        for base_raw, target_raw in cases:
+            if isinstance(base_raw, bytes):
+                base_file.write_bytes(base_raw)
+            else:
+                base_file.write_text(base_raw, encoding="utf-8")
+            target_file.write_text(target_raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["diff-config", "1.0.0", "2.0.0",
+                                              str(base_file), str(target_file)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, (base_raw, target_raw))
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        target_file.write_text(good, encoding="utf-8")
+        for arguments in (
+            ["diff-config", "v1", "2.0.0", str(base_file), str(target_file)],
+            ["diff-config", "1.0.0", "9.9.9", str(base_file), str(target_file)],
+            ["diff-config", "1.0.0", "2.0.0", str(Path(self.temp.name) / "nope.json"), str(target_file)],
+        ):
+            base_file.write_text(good, encoding="utf-8")
+            failed = subprocess.run(prefix + arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "diff-config", "1.0.0", "2.0.0", str(base_file), str(target_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
