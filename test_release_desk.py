@@ -4678,5 +4678,451 @@ class PreviewMergeChecklistTests(unittest.TestCase):
                           "current.json", "mismatched.json"})
 
 
+class ResolveMergeChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+
+    @staticmethod
+    def payload(items, version="1.2.0"):
+        return {"version": version, "items": items}
+
+    def base_payload(self):
+        return self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+
+    def conflicting_payloads(self):
+        # a: incoming and current diverge from the base; y: incoming deleted
+        # the item while the current side changed it.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        return base, incoming, current
+
+    def test_no_conflicts_with_empty_decisions_matches_preview(self):
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+            {"id": "e", "text": "Epsilon", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": False, "status": "done"},
+            {"id": "d", "text": "Delta", "required": False, "status": "pending"},
+        ])
+        preview = self.desk.preview_merge_checklist(
+            "1.2.0", self.base_payload(), incoming, current)
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", self.base_payload(), incoming, current, {})
+        self.assertEqual(set(result),
+                         {"version", "canMerge", "ready", "items", "conflicts", "resolved"})
+        self.assertTrue(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["items"], preview["items"])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["resolved"], [])
+
+    def test_empty_decisions_leaves_every_conflict_open(self):
+        base, incoming, current = self.conflicting_payloads()
+        preview = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {})
+        self.assertFalse(result["canMerge"])
+        self.assertEqual(result["resolved"], [])
+        self.assertEqual(result["conflicts"], preview["conflicts"])
+        self.assertEqual(result["items"], preview["items"])
+
+    def test_choose_incoming_adopts_whole_item(self):
+        base, incoming, current = self.conflicting_payloads()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "incoming", "y": "incoming"})
+        self.assertTrue(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["conflicts"], [])
+        # y is deleted because the incoming side lacks it; a takes incoming
+        # content wholesale, current-side order then incoming-only order.
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"}])
+        self.assertEqual(result["resolved"], [
+            {"id": "a", "choice": "incoming"}, {"id": "y", "choice": "incoming"}])
+
+    def test_choose_current_keeps_whole_item_and_confirms(self):
+        base, incoming, current = self.conflicting_payloads()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "current", "y": "current"})
+        self.assertTrue(result["canMerge"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"}])
+        self.assertEqual(result["resolved"], [
+            {"id": "a", "choice": "current"}, {"id": "y", "choice": "current"}])
+
+    def test_no_op_current_choice_still_recorded(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+        ])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "current"})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual(result["resolved"], [{"id": "a", "choice": "current"}])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"}])
+
+    def test_choose_missing_current_side_deletes_item(self):
+        # A conflict the current side lacks: choosing current deletes it.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+        ])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "current", "b": "current"})
+        self.assertTrue(result["canMerge"])
+        # a keeps the current content; b is missing on the chosen current side.
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"}])
+        self.assertEqual([entry["id"] for entry in result["resolved"]], ["a", "b"])
+
+    def test_choose_incoming_on_missing_current_side_adds_item(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "n", "text": "New", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+        ])
+        # n merges cleanly already; the a conflict is taken from incoming.
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "incoming"})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "n", "text": "New", "required": False, "status": "pending"}])
+
+    def test_partial_selection_keeps_remaining_conflicts(self):
+        base, incoming, current = self.conflicting_payloads()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "incoming"})
+        self.assertFalse(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["items"], [
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"}])
+        self.assertEqual(result["resolved"], [{"id": "a", "choice": "incoming"}])
+        self.assertEqual([entry["id"] for entry in result["conflicts"]], ["y"])
+        remaining = result["conflicts"][0]
+        self.assertEqual(set(remaining), {"id", "base", "incoming", "current"})
+        self.assertIsNone(remaining["incoming"])
+        self.assertEqual(remaining["current"]["status"], "done")
+
+    def test_arrays_sorted_by_id_code_point(self):
+        base = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "pending"},
+            {"id": "A", "text": "Ay", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "done"},
+            {"id": "A", "text": "Ay", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "blocked"},
+            {"id": "A", "text": "Ay", "required": True, "status": "blocked"},
+        ])
+        partial = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"b": "current"})
+        self.assertEqual([entry["id"] for entry in partial["conflicts"]], ["A"])
+        self.assertEqual([entry["id"] for entry in partial["resolved"]], ["b"])
+        full = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"b": "current", "A": "incoming"})
+        self.assertEqual([entry["id"] for entry in full["resolved"]], ["A", "b"])
+
+    def test_keys_match_exactly(self):
+        base, incoming, current = self.conflicting_payloads()
+        # A different case is not a normalized conflict id.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {"A": "incoming"})
+        # Neither is surrounding whitespace.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {" a": "incoming"})
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {"a ": "current"})
+
+    def test_invalid_decisions(self):
+        base, incoming, current = self.conflicting_payloads()
+        for decisions in (None, [], "x", 3, True):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    "1.2.0", base, incoming, current, decisions)
+        # Non-string keys.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {1: "incoming"})
+        # Illegal choice strings and non-string choices.
+        for decisions in ({"a": "base"}, {"a": "target"}, {"a": None},
+                          {"a": 0}, {"a": {"present": True}}, {"a": ["incoming"]}):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    "1.2.0", base, incoming, current, decisions)
+        # Keys must name original conflict ids, including clean-merge ids.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {"a": "incoming", "z": "current"})
+        clean_base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"}])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", clean_base, clean_base, clean_base, {"a": "current"})
+
+    def test_confirmed_result_must_remain_a_checklist(self):
+        # Both required items are conflict-deletable (a via missing incoming
+        # side, c via missing current side); the optional x merges cleanly.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "c", "text": "Gamma", "required": True, "status": "pending"},
+            {"id": "x", "text": "Xray", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "c", "text": "Gamma", "required": True, "status": "done"},
+            {"id": "x", "text": "Xray", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+            {"id": "x", "text": "Xray", "required": False, "status": "pending"},
+        ])
+        # The original preview itself is valid and keeps both conflicts open.
+        preview = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertEqual({entry["id"] for entry in preview["conflicts"]}, {"a", "c"})
+        # Confirming both deletions leaves only an optional item: invalid.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current,
+                {"a": "incoming", "c": "current"})
+        # Without x the same choices would empty the checklist.
+        base_nx = self.payload([item for item in base["items"] if item["id"] != "x"])
+        incoming_nx = self.payload([item for item in incoming["items"]
+                                    if item["id"] != "x"])
+        current_nx = self.payload([item for item in current["items"]
+                                   if item["id"] != "x"])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base_nx, incoming_nx, current_nx,
+                {"a": "incoming", "c": "current"})
+
+    def test_invalid_preview_still_raises(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "b", "text": "Beta", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "b", "text": "Beta", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {})
+
+    def test_validation_errors(self):
+        valid = self.base_payload()
+        for version in (None, "v1", "1.0", "9.9.9"):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    version, valid, valid, valid, {})
+        mismatched = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ], version="1.0.0")
+        for position in range(3):
+            inputs = [valid, valid, valid]
+            inputs[position] = mismatched
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist("1.2.0", *inputs, {})
+        invalid = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "weird"},
+        ])
+        for position in range(3):
+            inputs = [valid, valid, valid]
+            inputs[position] = invalid
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist("1.2.0", *inputs, {})
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", valid, valid, valid, {})
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        with self.assertRaises(ValueError):
+            desk.resolve_merge_checklist("1.2.0", valid, valid, valid, {})
+
+    def test_inputs_untouched_and_result_detached(self):
+        base, incoming, current = self.conflicting_payloads()
+        decisions = {"a": "incoming"}
+        snapshot = json.loads(json.dumps([base, incoming, current, decisions]))
+        store_before = self.path.read_bytes()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+        result["items"][0]["status"] = "pending"
+        result["conflicts"][0]["current"]["status"] = "pending"
+        result["resolved"][0]["choice"] = "current"
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "resolve-merge-checklist", *extra]
+
+    def write_files(self, base, incoming, current, decisions):
+        paths = []
+        for name, payload in (("base.json", base), ("incoming.json", incoming),
+                              ("current.json", current), ("decisions.json", decisions)):
+            path = Path(self.temp.name) / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def test_cli_partial_confirmation_still_conflicts(self):
+        base, incoming, current = self.conflicting_payloads()
+        base_p, incoming_p, current_p, decisions_p = self.write_files(
+            base, incoming, current, {"a": "incoming"})
+        before = [path.read_bytes()
+                  for path in (self.path, base_p, incoming_p, current_p, decisions_p)]
+        result = subprocess.run(
+            self.command("1.2.0", str(base_p), str(incoming_p), str(current_p),
+                         str(decisions_p)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report),
+                         {"version", "canMerge", "ready", "items", "conflicts", "resolved"})
+        self.assertFalse(report["canMerge"])
+        self.assertEqual([entry["id"] for entry in report["conflicts"]], ["y"])
+        self.assertEqual(report["resolved"], [{"id": "a", "choice": "incoming"}])
+        self.assertEqual([path.read_bytes()
+                          for path in (self.path, base_p, incoming_p, current_p, decisions_p)],
+                         before)
+
+    def test_cli_full_confirmation_merges(self):
+        base, incoming, current = self.conflicting_payloads()
+        base_p, incoming_p, current_p, decisions_p = self.write_files(
+            base, incoming, current, {"a": "incoming", "y": "incoming"})
+        result = subprocess.run(
+            self.command("1.2.0", str(base_p), str(incoming_p), str(current_p),
+                         str(decisions_p)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["canMerge"])
+        self.assertEqual(report["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in report["items"]], ["a"])
+
+    def test_cli_resolve_errors(self):
+        base, incoming, current = self.conflicting_payloads()
+        base_p, incoming_p, current_p, decisions_p = self.write_files(
+            base, incoming, current, {"a": "incoming"})
+        before = [path.read_bytes()
+                  for path in (self.path, base_p, incoming_p, current_p, decisions_p)]
+        # Non-UTF-8 bytes, JSON syntax errors and duplicate keys at any level
+        # in any of the four files.
+        variants = [
+            (base_p, b"\xff\xfe"),
+            (incoming_p, b"{not json"),
+            (current_p, b'{"version": "1.2.0", "version": "1.2.0", "items": []}'),
+            (decisions_p, b'{"a": "incoming", "a": "current"}'),
+        ]
+        for target, raw in variants:
+            target.write_bytes(raw)
+            failed = subprocess.run(
+                self.command("1.2.0", str(base_p), str(incoming_p), str(current_p),
+                             str(decisions_p)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        base_p.write_text(json.dumps(base), encoding="utf-8")
+        incoming_p.write_text(json.dumps(incoming), encoding="utf-8")
+        current_p.write_text(json.dumps(current), encoding="utf-8")
+        # Bad and unknown versions, a declared-version mismatch, non-object
+        # decisions and a decision key that is not a conflict id.
+        mismatched = Path(self.temp.name) / "mismatched.json"
+        mismatched.write_text(json.dumps(self.payload(
+            [{"id": "a", "text": "Alpha", "required": True, "status": "done"}],
+            version="1.0.0")), encoding="utf-8")
+        decisions_p.write_text(json.dumps(["a"]), encoding="utf-8")
+        for arguments in (
+                self.command("v1", str(base_p), str(incoming_p), str(current_p),
+                             str(decisions_p)),
+                self.command("9.9.9", str(base_p), str(incoming_p), str(current_p),
+                             str(decisions_p)),
+                self.command("1.2.0", str(mismatched), str(incoming_p), str(current_p),
+                             str(decisions_p))):
+            failed = subprocess.run(arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        decisions_p.write_text(json.dumps({"z": "incoming"}), encoding="utf-8")
+        failed = subprocess.run(
+            self.command("1.2.0", str(base_p), str(incoming_p), str(current_p),
+                         str(decisions_p)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        # A missing decisions file fails without creating anything.
+        missing = Path(self.temp.name) / "missing.json"
+        failed = subprocess.run(
+            self.command("1.2.0", str(base_p), str(incoming_p), str(current_p),
+                         str(missing)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        # Nothing was modified and no extra file or directory was created.
+        base_p.write_text(json.dumps(base), encoding="utf-8")
+        incoming_p.write_text(json.dumps(incoming), encoding="utf-8")
+        current_p.write_text(json.dumps(current), encoding="utf-8")
+        decisions_p.write_text(json.dumps({"a": "incoming"}), encoding="utf-8")
+        self.assertEqual([path.read_bytes()
+                          for path in (self.path, base_p, incoming_p, current_p, decisions_p)],
+                         before)
+        self.assertEqual({path.name for path in Path(self.temp.name).iterdir()},
+                         {"releases.json", "base.json", "incoming.json",
+                          "current.json", "decisions.json", "mismatched.json"})
+
+
 if __name__ == "__main__":
     unittest.main()
