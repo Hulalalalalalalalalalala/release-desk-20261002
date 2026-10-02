@@ -274,6 +274,32 @@ def _atomic_write(path, content):
         raise
 
 
+def _exclusive_write(path, content):
+    # Create-only write for release-record snapshots: the final name must not
+    # already exist, so an existing file or symlink is never replaced or
+    # followed. Missing parent directories are never created: opening the
+    # temporary file in them raises OSError before anything is made.
+    temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    try:
+        temp.write(content)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temp.close()
+        # link(2) fails when the destination name already exists, a dangling
+        # symlink included, and never follows a trailing symlink.
+        os.link(temp.name, path)
+    except OSError:
+        try:
+            os.unlink(temp.name)
+        except OSError:
+            pass
+        raise
+    try:
+        os.unlink(temp.name)
+    except OSError:
+        pass
+
+
 def _same_file(path_a, path_b):
     # Existing files: compare via inode so symlinks and hard links are caught.
     try:
@@ -464,6 +490,51 @@ class ReleaseDesk:
         return {"version": version, "ready": ready,
                 "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"],
                 "missing": missing, "mismatched": mismatched, "unexpected": unexpected}
+
+    def release_record(self, version, checklist, template, rollback):
+        # Read-only release snapshot: the audit follows the existing
+        # audit_checklist rules exactly, and a not-ready audit rejects the
+        # record without adding any optional-item blocking of its own. The
+        # returned snapshot is detached from every passed object and carries
+        # no generated timestamp, so identical inputs yield identical records.
+        audit = self.audit_checklist(version, checklist, template)
+        if not audit["ready"]:
+            raise ValueError("release record requires a ready audit")
+        target_version, steps = self._validated_rollback(rollback, version)
+        changes = self.export_releases([version])[version]
+        return {"version": version,
+                "changes": copy.deepcopy(changes),
+                "notes": self.notes(version),
+                "audit": copy.deepcopy(audit),
+                "rollback": {"targetVersion": target_version, "steps": steps}}
+
+    def _validated_rollback(self, rollback, release_version):
+        # Validate the rollback plan: a strict {"targetVersion", "steps"}
+        # object. targetVersion is null or a registered version numerically
+        # smaller than the release; steps is a non-empty array of single-line
+        # strings, stored trimmed with order and duplicates preserved.
+        if not isinstance(rollback, dict):
+            raise ValueError("rollback plan must be a JSON object")
+        if set(rollback) != {"targetVersion", "steps"}:
+            raise ValueError("rollback plan requires exactly targetVersion and steps")
+        target_version = rollback["targetVersion"]
+        if target_version is not None:
+            if not isinstance(target_version, str) or not re.fullmatch(VERSION_PATTERN, target_version):
+                raise ValueError("rollback targetVersion must be null or a valid version")
+            records = self._read_store()
+            if target_version not in records:
+                raise ValueError("rollback targetVersion must be a registered release")
+            if _version_order(target_version) >= _version_order(release_version):
+                raise ValueError("rollback targetVersion must be smaller than the release version")
+        steps = rollback["steps"]
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("rollback steps must be a non-empty array of strings")
+        normalized = []
+        for step in steps:
+            if not isinstance(step, str) or "\n" in step or "\r" in step or not step.strip():
+                raise ValueError("rollback steps must be non-empty single-line strings")
+            normalized.append(step.strip())
+        return target_version, normalized
 
     def reconcile_checklist(self, version, checklist, template):
         # Read-only update of a same-version checklist against a revised
@@ -1040,6 +1111,12 @@ def main():
     audit.add_argument("version")
     audit.add_argument("checklist")
     audit.add_argument("template")
+    record_release = commands.add_parser("record-release")
+    record_release.add_argument("version")
+    record_release.add_argument("checklist")
+    record_release.add_argument("template")
+    record_release.add_argument("rollback")
+    record_release.add_argument("--output")
     reconcile = commands.add_parser("reconcile-checklist")
     reconcile.add_argument("version")
     reconcile.add_argument("checklist")
@@ -1165,6 +1242,35 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.audit_checklist(args.version, checklist_payload, template_payload)
+            elif args.command == "record-release":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                try:
+                    rollback_payload = _loads_unique(Path(args.rollback).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("rollback file must contain UTF-8 encoded JSON") from exc
+                result = desk.release_record(args.version, checklist_payload,
+                                             template_payload, rollback_payload)
+                if args.output:
+                    output_path = Path(args.output)
+                    # The snapshot target must be a brand-new path: an existing
+                    # name or symlink (dangling ones included) is invalid input.
+                    if output_path.exists() or output_path.is_symlink():
+                        raise ValueError("release record output must not already exist")
+                    for label, other in (("store", desk.path),
+                                         ("checklist", Path(args.checklist)),
+                                         ("template", Path(args.template)),
+                                         ("rollback", Path(args.rollback))):
+                        if _same_file(output_path, other):
+                            raise ValueError(
+                                f"release record output must not be the same file as the {label} file")
+                    _exclusive_write(output_path, json.dumps(result, ensure_ascii=False) + "\n")
             elif args.command == "reconcile-checklist":
                 try:
                     checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
