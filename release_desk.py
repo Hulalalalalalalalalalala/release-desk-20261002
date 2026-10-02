@@ -1,6 +1,7 @@
 """Store releases and render change notes grouped by category."""
 import argparse
 import json
+import math
 import os
 import re
 import tempfile
@@ -470,6 +471,124 @@ class ReleaseDesk:
             raise ValueError("unknown release")
         return ReleaseDesk._clean_changes(records[version])
 
+    def diff_config(self, base_version, target_version, base_config, target_config):
+        # Read-only comparison of two caller-supplied configurations in the
+        # context of two registered releases; nothing is read from change
+        # entries, written to the store or inferred about actual changes.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        self._validated_config(base_config)
+        self._validated_config(target_config)
+        # The whole store is validated before the versions are looked up.
+        records = self._read_store()
+        for version in (base_version, target_version):
+            if version not in records:
+                raise ValueError("unknown release")
+        added, removed, changed = [], [], []
+        self._diff_config_values(base_config, target_config, "", added, removed, changed)
+        for entries in (added, removed, changed):
+            # Unicode code point order is plain string order in Python.
+            entries.sort(key=lambda entry: entry["path"])
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "added": added, "removed": removed, "changed": changed}
+
+    @staticmethod
+    def _validated_config(config):
+        if not isinstance(config, dict):
+            raise ValueError("config must be a JSON object")
+        ReleaseDesk._check_config_value(config, set())
+        return config
+
+    @staticmethod
+    def _check_config_value(value, active):
+        # Validates JSON values only: objects with string keys, arrays,
+        # strings, booleans, finite numbers and null. `active` holds the
+        # containers on the current path so circular references are caught.
+        if value is None or isinstance(value, (bool, int, str)):
+            return
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("config numbers must be finite")
+            return
+        if isinstance(value, (dict, list)):
+            ident = id(value)
+            if ident in active:
+                raise ValueError("config must not contain circular references")
+            active.add(ident)
+            try:
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if not isinstance(key, str):
+                            raise ValueError("config object keys must be strings")
+                        ReleaseDesk._check_config_value(item, active)
+                else:
+                    for item in value:
+                        ReleaseDesk._check_config_value(item, active)
+            finally:
+                active.discard(ident)
+            return
+        raise ValueError("config values must be JSON values")
+
+    @staticmethod
+    def _config_values_equal(base, target):
+        # Booleans never equal numbers; integers and floats compare by value.
+        if isinstance(base, bool) or isinstance(target, bool):
+            return isinstance(base, bool) and isinstance(target, bool) and base == target
+        if isinstance(base, (int, float)) and isinstance(target, (int, float)):
+            return base == target
+        if type(base) is not type(target):
+            return False
+        if isinstance(base, dict):
+            # Key order is ignored; keys match case-sensitively as decoded.
+            if len(base) != len(target):
+                return False
+            return all(key in target and ReleaseDesk._config_values_equal(value, target[key])
+                       for key, value in base.items())
+        if isinstance(base, list):
+            # Arrays compare element by element; order is significant.
+            return len(base) == len(target) and all(
+                ReleaseDesk._config_values_equal(base_item, target_item)
+                for base_item, target_item in zip(base, target))
+        return base == target
+
+    @staticmethod
+    def _diff_config_values(base, target, path, added, removed, changed):
+        if isinstance(base, dict) and isinstance(target, dict):
+            for key, base_value in base.items():
+                child = path + "/" + ReleaseDesk._escape_pointer(key)
+                if key not in target:
+                    removed.append({"path": child, "value": ReleaseDesk._copy_config(base_value)})
+                    continue
+                target_value = target[key]
+                if isinstance(base_value, dict) and isinstance(target_value, dict):
+                    ReleaseDesk._diff_config_values(base_value, target_value, child,
+                                                    added, removed, changed)
+                elif not ReleaseDesk._config_values_equal(base_value, target_value):
+                    changed.append({"path": child, "before": ReleaseDesk._copy_config(base_value),
+                                    "after": ReleaseDesk._copy_config(target_value)})
+            for key, target_value in target.items():
+                if key not in base:
+                    added.append({"path": path + "/" + ReleaseDesk._escape_pointer(key),
+                                  "value": ReleaseDesk._copy_config(target_value)})
+        elif not ReleaseDesk._config_values_equal(base, target):
+            changed.append({"path": path, "before": ReleaseDesk._copy_config(base),
+                            "after": ReleaseDesk._copy_config(target)})
+
+    @staticmethod
+    def _escape_pointer(key):
+        # JSON Pointer (RFC 6901) escaping; the empty key stays legal.
+        return key.replace("~", "~0").replace("/", "~1")
+
+    @staticmethod
+    def _copy_config(value):
+        # Result entries never share containers with the caller's configs.
+        if isinstance(value, dict):
+            return {key: ReleaseDesk._copy_config(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [ReleaseDesk._copy_config(item) for item in value]
+        return value
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -489,6 +608,11 @@ def main():
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
+    diff_config_cmd = commands.add_parser("diff-config")
+    diff_config_cmd.add_argument("base_version")
+    diff_config_cmd.add_argument("target_version")
+    diff_config_cmd.add_argument("base_file")
+    diff_config_cmd.add_argument("target_file")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -519,6 +643,17 @@ def main():
                 result = desk.preview_import_releases(payload) if args.dry_run else desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
+            elif args.command == "diff-config":
+                try:
+                    base_config = _loads_unique(Path(args.base_file).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base config file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_config = _loads_unique(Path(args.target_file).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target config file must contain UTF-8 encoded JSON") from exc
+                result = desk.diff_config(args.base_version, args.target_version,
+                                          base_config, target_config)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
