@@ -204,6 +204,93 @@ class ReleaseDeskTests(unittest.TestCase):
                 self.desk.import_releases(payload)
             self.assertFalse(self.path.exists())
 
+    def test_store_duplicate_keys_rejected_everywhere(self):
+        raw = ('{"1.0.0": [{"category": "Added", "text": "One"}],'
+               ' "1.0.0": [{"category": "Added", "text": "One"}]}').encode()
+        self.path.write_bytes(raw)
+        actions = [
+            self.desk.versions,
+            self.desk.releases,
+            lambda: self.desk.notes("1.0.0"),
+            lambda: self.desk.diff("1.0.0", "1.0.0"),
+            lambda: self.desk.add("2.0.0", [{"category": "Added", "text": "New"}]),
+            lambda: self.desk.import_releases({"2.0.0": [{"category": "Added", "text": "New"}]}),
+        ]
+        for action in actions:
+            with self.assertRaises(ValueError) as caught:
+                action()
+            self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_store_duplicate_keys_nested_and_unqueried(self):
+        cases = [
+            '{"1.0.0": [{"category": "Added", "category": "Added", "text": "One"}]}',
+            '{"1.0.0": [{"category": "Added", "text": "One", "extra": 1, "extra": 1}]}',
+            '{"1.0.0": [{"category": "Added", "text": "One"}],'
+            ' "2.0.0": [{"category": "Added", "text": "Two", "text": "Two"}]}',
+            '{"1.0.0": [{"category": "Added", "t\\u0065xt": "One", "text": "One"}]}',
+        ]
+        for raw in cases:
+            self.path.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                self.desk.notes("1.0.0")
+            self.assertEqual(str(caught.exception), "duplicate JSON object key")
+            self.assertEqual(self.path.read_text(encoding="utf-8"), raw)
+
+    def test_store_keys_decoded_exactly(self):
+        # Case differs: not a duplicate. Same key in sibling objects: fine.
+        # Quotes and field-like text inside string values: no false positive.
+        self.path.write_text(
+            '{"1.0.0": [{"category": "Added", "text": "One", "Text": "Two"},'
+            ' {"category": "Fixed", "text": "say \\"text\\": {\\"text\\": 1}"}]}',
+            encoding="utf-8")
+        self.assertEqual(self.desk.versions(), ["1.0.0"])
+        notes = self.desk.notes("1.0.0")
+        self.assertIn('- say "text": {"text": 1}', notes)
+
+    def test_cli_duplicate_keys_in_changes_file(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        changes = Path(self.temp.name) / "changes.json"
+        changes.write_text('[{"category": "Added", "text": "One", "text": "One"}]', encoding="utf-8")
+        failed = subprocess.run(prefix + ["add", "1.0.0", str(changes)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertFalse(self.path.exists())
+
+    def test_cli_duplicate_keys_create_nothing(self):
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(store)]
+        batch = Path(self.temp.name) / "batch.json"
+        batch.write_text('{"1.0.0": [{"category": "Added", "text": "One"}],'
+                         ' "1.0.0": [{"category": "Added", "text": "One"}]}', encoding="utf-8")
+        failed = subprocess.run(prefix + ["import", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+    def test_cli_duplicate_keys_leave_store_untouched(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        batch = Path(self.temp.name) / "batch.json"
+        batch.write_text('{"1.0.0": [{"category": "Added", "text": "One", "extra": 1, "extra": 2}],'
+                         ' "2.0.0": [{"category": "Added", "text": "New"}]}', encoding="utf-8")
+        failed = subprocess.run(prefix + ["import", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.desk.versions(), ["1.0.0"])
+
+    def test_cli_identical_change_entries_still_legal(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        changes = Path(self.temp.name) / "changes.json"
+        changes.write_text('[{"category": "Fixed", "text": "Retry"},'
+                           ' {"category": "Fixed", "text": "Retry"}]', encoding="utf-8")
+        added = subprocess.run(prefix + ["add", "1.0.0", str(changes)], capture_output=True, text=True)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(json.loads(added.stdout), {"version": "1.0.0", "changes": 2})
+
     def test_import_invalid_target_store(self):
         self.desk.add("2.0.0", [{"category": "Added", "text": "Keep"}])
         payload = {"1.0.0": [{"category": "Added", "text": "New"}]}

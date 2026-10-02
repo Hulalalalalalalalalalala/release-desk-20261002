@@ -12,6 +12,21 @@ CATEGORIES = ("Added", "Changed", "Fixed")
 VERSION_PATTERN = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
 
 
+def _unique_object(pairs):
+    # object_pairs_hook for json.loads: reject repeated keys within one object.
+    # Decoded keys compare case-sensitively, without trimming or normalization.
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _loads_unique(raw):
+    return json.loads(raw, object_pairs_hook=_unique_object)
+
+
 class ReleaseDesk:
     def __init__(self, path):
         self.path = Path(path)
@@ -81,7 +96,7 @@ class ReleaseDesk:
         if not raw:
             raise ValueError("release store must be a JSON object")
         try:
-            records = json.loads(raw)
+            records = _loads_unique(raw)
         except json.JSONDecodeError as exc:
             raise ValueError("release store must be a JSON object") from exc
         return self._validated_records(records)
@@ -183,10 +198,10 @@ def main():
             print(desk.notes(args.version), end="")
         else:
             if args.command == "add":
-                result = desk.add(args.version, json.loads(Path(args.changes).read_text(encoding="utf-8")))
+                result = desk.add(args.version, _loads_unique(Path(args.changes).read_text(encoding="utf-8")))
             elif args.command == "import":
                 try:
-                    payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+                    payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("import file must contain UTF-8 encoded JSON") from exc
                 result = desk.import_releases(payload)
