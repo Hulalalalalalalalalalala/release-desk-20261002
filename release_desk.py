@@ -99,6 +99,35 @@ class ReleaseDesk:
             self._write_store(records)
         return {"imported": imported, "skipped": skipped}
 
+    def preview_import_releases(self, payload):
+        incoming = self._validated_payload(payload)
+        # The whole existing store is validated, even for an empty batch.
+        records = self._read_store()
+        imported, skipped, conflicts = [], [], []
+        for version, changes in incoming.items():
+            if version not in records:
+                imported.append(version)
+                continue
+            existing = self._clean_changes(records[version])
+            if existing == changes:
+                skipped.append(version)
+                continue
+            added, removed, unchanged = self._classify_changes(existing, changes)
+            conflicts.append({
+                "version": version,
+                "added": added,
+                "removed": removed,
+                "unchanged": unchanged,
+                # Per-category multisets match, so only the array order differs.
+                "orderOnly": not added and not removed,
+            })
+        order = _version_order
+        imported.sort(key=order)
+        skipped.sort(key=order)
+        conflicts.sort(key=lambda conflict: order(conflict["version"]))
+        return {"imported": imported, "skipped": skipped,
+                "conflicts": conflicts, "canImport": not conflicts}
+
     def export_releases(self, versions=None):
         if versions is None:
             selected = None
@@ -202,6 +231,16 @@ class ReleaseDesk:
         records = self._read_store()
         base = self._checked_entries(records, base_version)
         target = self._checked_entries(records, target_version)
+        added, removed, unchanged = self._classify_changes(base, target)
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "added": added, "removed": removed, "unchanged": unchanged}
+
+    @staticmethod
+    def _classify_changes(base, target):
+        # Entries match on category plus trimmed, case-sensitive text; duplicates
+        # pair up by occurrence. Categories follow the fixed order. Added and
+        # unchanged entries keep the target's order within each category, removed
+        # entries keep the base's order.
         added, removed, unchanged = [], [], []
         for category in CATEGORIES:
             base_entries = [entry for entry in base if entry["category"] == category]
@@ -219,8 +258,7 @@ class ReleaseDesk:
                     matched[entry["text"]] -= 1
                 else:
                     removed.append(entry)
-        return {"baseVersion": base_version, "targetVersion": target_version,
-                "added": added, "removed": removed, "unchanged": unchanged}
+        return added, removed, unchanged
 
     @staticmethod
     def _checked_entries(records, version):
@@ -238,7 +276,9 @@ def main():
     add.add_argument("changes")
     commands.add_parser("notes").add_argument("version")
     commands.add_parser("versions")
-    commands.add_parser("import").add_argument("file")
+    import_cmd = commands.add_parser("import")
+    import_cmd.add_argument("file")
+    import_cmd.add_argument("--dry-run", action="store_true")
     export = commands.add_parser("export")
     export.add_argument("--version", action="append", dest="versions")
     export.add_argument("--output")
@@ -258,7 +298,10 @@ def main():
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("import file must contain UTF-8 encoded JSON") from exc
-                result = desk.import_releases(payload)
+                if args.dry_run:
+                    result = desk.preview_import_releases(payload)
+                else:
+                    result = desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
             elif args.command == "export":
