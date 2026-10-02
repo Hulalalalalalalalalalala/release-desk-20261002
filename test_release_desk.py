@@ -2487,6 +2487,136 @@ class ConfigResolveTests(unittest.TestCase):
         result["config"]["gone"]["a"].append(4)
         self.assertEqual(current["gone"]["a"], [3])
 
+    def test_custom_value_replaces_field_and_records_custom(self):
+        # Port is 80/8080/9000 on the three sides; a custom 9001 is confirmed
+        # while the current side's independent timeout edit is kept.
+        result = self.resolve({"port": 80, "timeout": 30},
+                              {"port": 8080, "timeout": 30},
+                              {"port": 9000, "timeout": 60},
+                              {"/port": {"present": True, "value": 9001}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9001, "timeout": 60})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+
+    def test_custom_value_equal_to_a_side_still_counts_as_custom(self):
+        result = self.resolve({"port": 80}, {"port": 8080}, {"port": 9000},
+                              {"/port": {"present": True, "value": 8080}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 8080})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+
+    def test_custom_present_false_deletes_field(self):
+        result = self.resolve({"a": 1, "k": 9}, {"a": 1, "k": 8}, {"a": 1, "k": 2},
+                              {"/k": {"present": False}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 1})
+        self.assertEqual(result["resolved"], [{"path": "/k", "choice": "custom"}])
+
+    def test_custom_null_and_structured_values_kept_wholesale(self):
+        null_result = self.resolve({"a": 1}, {"a": 2}, {"a": 3},
+                                   {"/a": {"present": True, "value": None}})
+        self.assertIn("a", null_result["config"])
+        self.assertIsNone(null_result["config"]["a"])
+        # Objects, arrays and type changes are replaced as a whole.
+        value = {"nested": [1, {"x": True}], "s": "中"}
+        result = self.resolve({"a": {"y": 1}}, {"a": {"y": 2}}, {"a": 3},
+                              {"/a": {"present": True, "value": value}})
+        self.assertEqual(result["config"], {"a": value})
+        array_result = self.resolve({"l": [1]}, {"l": [2]}, {"l": [3]},
+                                    {"/l": {"present": True, "value": [9, 8]}})
+        self.assertEqual(array_result["config"], {"l": [9, 8]})
+
+    def test_mixed_string_and_custom_choices(self):
+        base = {"port": 80, "timeout": 30, "note": "x"}
+        target = {"port": 8080, "timeout": 3, "note": "y"}
+        current = {"port": 9000, "timeout": 60, "note": "x"}
+        decisions = {"/port": {"present": True, "value": 9001}, "/timeout": "current"}
+        result = self.resolve(base, target, current, decisions)
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9001, "timeout": 60, "note": "y"})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"},
+                                              {"path": "/timeout", "choice": "current"}])
+
+    def test_partial_custom_choices_leave_remaining_conflicts(self):
+        base = {"port": 80, "timeout": 30}
+        target = {"port": 8080, "timeout": 3}
+        current = {"port": 9000, "timeout": 60}
+        result = self.resolve(base, target, current,
+                              {"/port": {"present": True, "value": 9001}})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9001, "timeout": 60})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/timeout"])
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+
+    def test_custom_choices_need_conflict_paths_too(self):
+        base, target, current = {"a": 1, "b": 1}, {"a": 2, "b": 1}, {"a": 3, "b": 1}
+        for path in ("/b", "/a/x", ""):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, {path: {"present": False}})
+
+    def test_invalid_custom_choices(self):
+        base, target, current = {"a": 1}, {"a": 2}, {"a": 3}
+        bad_choices = [
+            {}, {"present": True}, {"value": 1}, {"present": False, "value": 1},
+            {"present": True, "value": 1, "extra": 2}, {"present": False, "extra": 2},
+            {"present": 1, "value": 1}, {"present": "true"}, {"present": None},
+            {"present": True, "value": float("nan")}, {"present": True, "value": object()},
+            {"present": True, "value": {1: "x"}},
+        ]
+        for choice in bad_choices:
+            with self.assertRaises(ValueError, msg=repr(choice)):
+                self.resolve(base, target, current, {"/a": choice})
+        cycle = {}
+        cycle["self"] = cycle
+        with self.assertRaises(ValueError):
+            self.resolve(base, target, current, {"/a": {"present": True, "value": cycle}})
+        # Non-string, non-object choices remain invalid.
+        for choice in (None, 0, True, ["target"], ("target",)):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, {"/a": choice})
+
+    def test_custom_values_detached_from_decisions(self):
+        value = {"nested": [1]}
+        decisions = {"/a": {"present": True, "value": value}}
+        result = self.resolve({"a": 1}, {"a": 2}, {"a": 3}, decisions)
+        self.assertEqual(result["config"], {"a": {"nested": [1]}})
+        result["config"]["a"]["nested"].append(2)
+        self.assertEqual(value, {"nested": [1]})
+        self.assertEqual(decisions, {"/a": {"present": True, "value": {"nested": [1]}}})
+
+    def test_cli_resolve_config_custom_choices(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        current_file = Path(self.temp.name) / "current.json"
+        decisions_file = Path(self.temp.name) / "decisions.json"
+        base_file.write_text(json.dumps({"port": 80, "timeout": 30}), encoding="utf-8")
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 30}), encoding="utf-8")
+        current_file.write_text(json.dumps({"port": 9000, "timeout": 60}), encoding="utf-8")
+        decisions_file.write_text(json.dumps({"/port": {"present": True, "value": 9001}}),
+                                  encoding="utf-8")
+        result = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                          str(base_file), str(target_file),
+                                          str(current_file), str(decisions_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "baseVersion": "1.0.0", "targetVersion": "2.0.0", "canApply": True,
+            "config": {"port": 9001, "timeout": 60},
+            "conflicts": [], "resolved": [{"path": "/port", "choice": "custom"}]})
+        # Malformed custom objects fail with a single-line error and exit 2.
+        for raw in ('{"/port": {"present": true}}',
+                    '{"/port": {"present": 1, "value": 9001}}',
+                    '{"/port": {"present": false, "value": 9001}}',
+                    '{"/port": {"present": true, "value": NaN}}'):
+            decisions_file.write_text(raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                              str(base_file), str(target_file),
+                                              str(current_file), str(decisions_file)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+
     def test_cli_resolve_config(self):
         prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
         base_file = Path(self.temp.name) / "base.json"

@@ -63,6 +63,33 @@ def _validated_config(value, seen=None):
     return value
 
 
+def _validated_json_value(value):
+    # Any legal JSON value (not only objects), under the same rules as
+    # configurations: string keys, JSON values only, finite numbers, no cycles.
+    return _validated_config(value, set())
+
+
+def _validated_choice(choice):
+    # A decision choice is the string "target" or "current", or a custom
+    # object: {"present": False} deletes the field, while
+    # {"present": True, "value": <any JSON>} replaces it wholesale.
+    if isinstance(choice, str):
+        if choice not in ("target", "current"):
+            raise ValueError("decision choice must be target, current or a custom object")
+        return
+    if not isinstance(choice, dict):
+        raise ValueError("decision choice must be target, current or a custom object")
+    present = choice.get("present")
+    if not isinstance(present, bool):
+        raise ValueError("custom decision present must be a boolean")
+    if present:
+        if set(choice) != {"present", "value"}:
+            raise ValueError("custom decision with present true requires exactly present and value")
+        _validated_json_value(choice["value"])
+    elif set(choice) != {"present"}:
+        raise ValueError("custom decision with present false requires only present")
+
+
 def _json_values_equal(base, target):
     # Recursive JSON equality: object key order is ignored, array order counts.
     if isinstance(base, bool) or isinstance(target, bool):
@@ -165,7 +192,8 @@ def _version_order(version):
 
 def _resolve_config_values(base, target, current, path, choices, resolved):
     # Three-way merge mirroring _preview_config_values, applying confirmed
-    # whole-field choices at conflict paths. All values are traversed
+    # whole-field choices at conflict paths: "target", "current" or a custom
+    # object replacing the field wholesale. All values are traversed
     # read-only; the returned object is built from deep copies.
     resolved_config = {}
     for key in base.keys() | target.keys() | current.keys():
@@ -190,6 +218,12 @@ def _resolve_config_values(base, target, current, path, choices, resolved):
                 # Unresolved conflict: keep the current presence state and value.
                 if cp:
                     resolved_config[key] = copy.deepcopy(cv)
+            elif isinstance(choice, dict):
+                # Custom choice: the whole field is replaced (or deleted when
+                # present is false), even when the value matches a side.
+                resolved.append({"path": child_path, "choice": "custom"})
+                if choice["present"]:
+                    resolved_config[key] = copy.deepcopy(choice["value"])
             else:
                 side = tv if choice == "target" else cv
                 present = tp if choice == "target" else cp
@@ -688,7 +722,8 @@ class ReleaseDesk:
                        current_config, decisions):
         # Read-only three-way resolution with per-path conflict choices. The
         # decisions map original preview_config conflict paths verbatim to
-        # "target" or "current"; nothing is stored or inferred from entries.
+        # "target", "current" or a custom object; nothing is stored or
+        # inferred from entries.
         for version in (base_version, target_version):
             if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
                 raise ValueError("version must have three nonnegative numeric components")
@@ -700,8 +735,7 @@ class ReleaseDesk:
         for path, choice in decisions.items():
             if not isinstance(path, str):
                 raise ValueError("decision keys must be strings")
-            if choice not in ("target", "current"):
-                raise ValueError("decision choice must be target or current")
+            _validated_choice(choice)
         # The whole store is validated before either version is looked up.
         records = self._read_store()
         if base_version not in records:
