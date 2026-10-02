@@ -120,9 +120,11 @@ def _preview_side(present, value):
     return side
 
 
-def _preview_config_values(base, target, current, path, conflicts):
+def _preview_config_values(base, target, current, path, conflicts, decisions=None):
     # Three-way merge of one object level. All three values are objects;
     # arrays, scalars and whole added/removed subobjects never reach here.
+    # When decisions maps a conflict path to "target" or "current", that side
+    # is adopted wholesale and no conflict is recorded for the path.
     preview = {}
     for key in base.keys() | target.keys() | current.keys():
         child_path = path + "/" + _escape_pointer_token(key)
@@ -144,17 +146,26 @@ def _preview_config_values(base, target, current, path, conflicts):
         elif bp and tp and cp and isinstance(bv, dict) and isinstance(tv, dict) and isinstance(cv, dict):
             # All three sides changed the same field, each to another object:
             # preview the subfields independently.
-            preview[key] = _preview_config_values(bv, tv, cv, child_path, conflicts)
+            preview[key] = _preview_config_values(bv, tv, cv, child_path, conflicts, decisions)
         else:
             # Divergent whole values (arrays, type changes, added/removed
             # subobjects, changed fields the current side lacks): one conflict
-            # at this path, keeping the current presence state and value.
-            conflicts.append({"path": child_path,
-                              "base": _preview_side(bp, bv),
-                              "target": _preview_side(tp, tv),
-                              "current": _preview_side(cp, cv)})
-            if cp:
-                preview[key] = cv
+            # at this path, keeping the current presence state and value,
+            # unless a decision confirms one side wholesale.
+            choice = decisions.get(child_path) if decisions else None
+            if choice == "target":
+                if tp:
+                    preview[key] = tv
+            elif choice == "current":
+                if cp:
+                    preview[key] = cv
+            else:
+                conflicts.append({"path": child_path,
+                                  "base": _preview_side(bp, bv),
+                                  "target": _preview_side(tp, tv),
+                                  "current": _preview_side(cp, cv)})
+                if cp:
+                    preview[key] = cv
     return preview
 
 
@@ -646,6 +657,49 @@ class ReleaseDesk:
         return {"baseVersion": base_version, "targetVersion": target_version,
                 "canApply": not conflicts, "config": preview, "conflicts": conflicts}
 
+    def resolve_config(self, base_version, target_version,
+                       base_config, target_config, current_config, decisions):
+        # Read-only per-path confirmation of preview_config conflicts: each
+        # decision picks the target or current side of one original conflict
+        # wholesale. Nothing is stored and the inputs are never modified.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        _validated_config(base_config)
+        _validated_config(target_config)
+        _validated_config(current_config)
+        if not isinstance(decisions, dict):
+            raise ValueError("decisions must be a JSON object")
+        for path, choice in decisions.items():
+            if not isinstance(path, str):
+                raise ValueError("decision paths must be strings")
+            if choice not in ("target", "current"):
+                raise ValueError("decision choices must be target or current")
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        conflicts = []
+        preview = _preview_config_values(base_config, target_config, current_config, "", conflicts)
+        conflict_paths = {entry["path"] for entry in conflicts}
+        for path in decisions:
+            # Decision keys match the original conflict paths verbatim, with
+            # no trimming or normalization; unknown paths are rejected.
+            if path not in conflict_paths:
+                raise ValueError("decision path is not an original conflict")
+        if decisions:
+            conflicts = []
+            preview = _preview_config_values(
+                base_config, target_config, current_config, "", conflicts, decisions)
+        # Both arrays sort by path in Unicode code point order.
+        conflicts.sort(key=lambda entry: entry["path"])
+        resolved = [{"path": path, "choice": decisions[path]} for path in sorted(decisions)]
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "canApply": not conflicts, "config": preview,
+                "conflicts": conflicts, "resolved": resolved}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -676,6 +730,13 @@ def main():
     preview_config.add_argument("base_config")
     preview_config.add_argument("target_config")
     preview_config.add_argument("current_config")
+    resolve_config = commands.add_parser("resolve-config")
+    resolve_config.add_argument("base_version")
+    resolve_config.add_argument("target_version")
+    resolve_config.add_argument("base_config")
+    resolve_config.add_argument("target_config")
+    resolve_config.add_argument("current_config")
+    resolve_config.add_argument("decisions")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -732,6 +793,26 @@ def main():
                     raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
                 result = desk.preview_config(args.base_version, args.target_version,
                                              base_payload, target_payload, current_payload)
+            elif args.command == "resolve-config":
+                try:
+                    base_payload = _loads_unique(Path(args.base_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_payload = _loads_unique(Path(args.target_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    current_payload = _loads_unique(Path(args.current_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    decisions_payload = _loads_unique(Path(args.decisions).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("decisions file must contain UTF-8 encoded JSON") from exc
+                result = desk.resolve_config(args.base_version, args.target_version,
+                                             base_payload, target_payload, current_payload,
+                                             decisions_payload)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
