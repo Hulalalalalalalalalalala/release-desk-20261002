@@ -78,6 +78,73 @@ class ReleaseDesk:
             clean.append({"category": category, "text": text.strip()})
         return clean
 
+    def export_releases(self, versions=None):
+        if versions is not None and not isinstance(versions, list):
+            raise ValueError("versions must be None or a list of version strings")
+        if versions is None:
+            chosen_names = None
+        else:
+            chosen_names, seen = [], set()
+            for version in versions:
+                if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                    raise ValueError("version must have three nonnegative numeric components")
+                # Repeated names export once; first occurrence survives the dedup.
+                if version not in seen:
+                    seen.add(version)
+                    chosen_names.append(version)
+        # The whole store is validated even when the selection is small or empty.
+        records = self._read_store()
+        if chosen_names is None:
+            chosen_names = list(records)
+        else:
+            for version in chosen_names:
+                if version not in records:
+                    raise ValueError("unknown release")
+        order = lambda version: tuple(map(int, version.split(".")))
+        # Cleaning keeps only category and stripped text, with array order and repeats.
+        return {version: self._clean_changes(records[version])
+                for version in sorted(chosen_names, key=order)}
+
+    def export_releases_file(self, output, versions=None):
+        exported = self.export_releases(versions)
+        target = Path(output)
+        if self._same_path(target, self.path):
+            raise ValueError("export output must not be the release store")
+        self._write_json_file(target, exported)
+        return {"exported": list(exported)}
+
+    @staticmethod
+    def _same_path(left, right):
+        # Lexical aliases (./x, a/../x) match even when neither path exists yet.
+        left_abs, right_abs = os.path.abspath(left), os.path.abspath(right)
+        if os.path.normcase(left_abs) == os.path.normcase(right_abs):
+            return True
+        if os.path.normcase(os.path.realpath(left_abs)) == os.path.normcase(os.path.realpath(right_abs)):
+            return True
+        try:
+            # Existing symlinks and hard links share identity despite different names.
+            return os.path.samefile(left, right)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _write_json_file(target, records):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(records, ensure_ascii=False) + "\n"
+        temp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False)
+        try:
+            temp.write(content)
+            temp.flush()
+            os.fsync(temp.fileno())
+            temp.close()
+            os.replace(temp.name, target)
+        except OSError:
+            try:
+                os.unlink(temp.name)
+            except OSError:
+                pass
+            raise
+
     def _validated_payload(self, payload):
         if not isinstance(payload, dict):
             raise ValueError("import payload must be a JSON object")
@@ -191,6 +258,9 @@ def main():
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
+    export = commands.add_parser("export")
+    export.add_argument("--version", dest="versions", action="append")
+    export.add_argument("--output")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -207,6 +277,11 @@ def main():
                 result = desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
+            elif args.command == "export":
+                if args.output is None:
+                    result = desk.export_releases(args.versions)
+                else:
+                    result = desk.export_releases_file(args.output, args.versions)
             else:
                 result = desk.versions()
             print(json.dumps(result, ensure_ascii=False))

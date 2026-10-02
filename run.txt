@@ -9,4 +9,8 @@ Prints release notes containing Added and Fixed sections.
 Smoke Test
 python3 release_desk.py versions
 Prints versions 1.0.0 and 1.1.0 in numeric order.
+python3 release_desk.py export
+Prints all releases as a single-line JSON object, sorted by numeric version.
+python3 release_desk.py export --version 1.1.0 --output /var/tmp/releases-export.json
+Writes the selected release to a UTF-8 JSON file and prints the exported versions.
 python3 -B -m unittest -v
