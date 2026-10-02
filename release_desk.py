@@ -185,7 +185,65 @@ class ReleaseDesk:
         records = self._read_store()
         if version not in records:
             raise ValueError("unknown release")
-        present = {change["category"] for change in records[version]}
+        selected = self._applicable_template_items(items, records[version])
+        return {"version": version, "items": selected}
+
+    def audit_checklist(self, version, checklist, template):
+        # Read-only audit of a declared checklist against the template items
+        # applicable to the same release; status is never inferred from texts.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        template_items = self._validated_template(template)
+        # The whole store is validated before the version is looked up.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(template_items, records[version])
+        groups = {"done": [], "pending": [], "blocked": []}
+        ready = True
+        for item in items:
+            groups[item["status"]].append(
+                {"id": item["id"], "text": item["text"],
+                 "required": item["required"], "status": item["status"]}
+            )
+            if item["required"] and item["status"] != "done":
+                ready = False
+        # Ids match case-sensitively after trimming, without Unicode normalization.
+        actual_by_id = {item["id"]: item for item in items}
+        expected_ids = set()
+        missing, mismatched = [], []
+        for expected in selected:
+            expected_ids.add(expected["id"])
+            actual = actual_by_id.get(expected["id"])
+            if actual is None:
+                missing.append({"id": expected["id"], "text": expected["text"],
+                                "required": expected["required"], "status": "pending"})
+            elif actual["text"] != expected["text"] or actual["required"] != expected["required"]:
+                mismatched.append({
+                    "expected": {"id": expected["id"], "text": expected["text"],
+                                 "required": expected["required"], "status": "pending"},
+                    "actual": {"id": actual["id"], "text": actual["text"],
+                               "required": actual["required"], "status": actual["status"]}})
+            else:
+                if expected["required"] and actual["status"] != "done":
+                    ready = False
+                continue
+            # Differences in optional template items never affect readiness.
+            if expected["required"]:
+                ready = False
+        unexpected = [
+            {"id": item["id"], "text": item["text"],
+             "required": item["required"], "status": item["status"]}
+            for item in items if item["id"] not in expected_ids
+        ]
+        return {"version": version, "ready": ready,
+                "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"],
+                "missing": missing, "mismatched": mismatched, "unexpected": unexpected}
+
+    @staticmethod
+    def _applicable_template_items(items, changes):
+        present = {change["category"] for change in changes}
         selected = []
         for item in items:
             categories = item["categories"]
@@ -196,7 +254,7 @@ class ReleaseDesk:
             raise ValueError("no template items apply to this release")
         if not any(item["required"] for item in selected):
             raise ValueError("checklist requires at least one required item")
-        return {"version": version, "items": selected}
+        return selected
 
     @staticmethod
     def _validated_template(payload):
@@ -402,6 +460,10 @@ def main():
     make_checklist = commands.add_parser("make-checklist")
     make_checklist.add_argument("version")
     make_checklist.add_argument("file")
+    audit = commands.add_parser("audit-checklist")
+    audit.add_argument("version")
+    audit.add_argument("checklist")
+    audit.add_argument("template")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -430,6 +492,16 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.generate_checklist(args.version, payload)
+            elif args.command == "audit-checklist":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                result = desk.audit_checklist(args.version, checklist_payload, template_payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
