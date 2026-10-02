@@ -1740,6 +1740,437 @@ class ReconcileChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class MigrateChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.1.0", [
+            {"category": "Added", "text": "Group changes by category"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+        ])
+        self.desk.add("1.2.0", [
+            {"category": "Added", "text": "Group changes by category"},
+            {"category": "Added", "text": "Retry empty exports"},
+            {"category": "Changed", "text": "Sort versions"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+        ])
+
+    def template(self):
+        return {"items": [
+            {"id": "docs", "text": " Write notes ", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            {"id": "changed", "text": "Explain changes", "required": False, "categories": ["Changed"]},
+        ]}
+
+    def checklist(self, **overrides):
+        data = {
+            "version": "1.1.0",
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+                {"id": " fixed ", "text": "Verify fix", "required": True, "status": "done"},
+                {"id": "added", "text": "Announce feature", "required": False, "status": "blocked"},
+                {"id": "legacy", "text": "Legacy", "required": False, "status": "done"},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_retained_reset_added_removed_classification(self):
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        self.assertEqual(set(result),
+                         {"baseVersion", "version", "items", "retained", "reset", "added", "removed"})
+        self.assertEqual(result["baseVersion"], "1.1.0")
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+            {"id": "changed", "text": "Explain changes", "required": False, "status": "pending"},
+        ])
+        # Only Added changed between releases: the Fixed check keeps done, the
+        # generic and Added-scoped checks reset.
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual(result["reset"], ["docs", "added"])
+        self.assertEqual(result["added"], ["changed"])
+        self.assertEqual(result["removed"], ["legacy"])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_only_added_change_keeps_fixed_done(self):
+        template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "docs", "text": "Write notes", "required": True},
+        ]}
+        checklist = {"version": "1.1.0", "items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+        ]}
+        # Added and Changed entries differ but Fixed is unchanged: only the
+        # Fixed-scoped check keeps done.
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", checklist, template)
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual(result["reset"], ["docs"])
+        self.assertEqual(result["items"][0]["status"], "done")
+        self.assertEqual(result["items"][1]["status"], "pending")
+
+    def test_duplicate_count_change_resets_fixed_item(self):
+        self.desk.add("1.3.0", [
+            {"category": "Added", "text": "Group changes by category"},
+            {"category": "Added", "text": "Retry empty exports"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+        ])
+        template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "docs", "text": "Write notes", "required": True},
+        ]}
+        # 1.3.0 -> 1.2.0 removes one duplicate Fixed entry: Fixed resets even
+        # though one identical Fixed entry remains.
+        checklist = {"version": "1.3.0", "items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+        ]}
+        result = self.desk.migrate_checklist("1.3.0", "1.2.0", checklist, template)
+        self.assertEqual(result["reset"], ["fixed", "docs"])
+        self.assertEqual(result["retained"], [])
+
+    def test_order_ignored_but_duplicates_count_within_categories(self):
+        self.desk.add("2.0.0", [
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+            {"category": "Fixed", "text": "Retry empty exports"},
+            {"category": "Added", "text": "Group changes by category"},
+        ])
+        self.desk.add("2.0.1", [
+            {"category": "Fixed", "text": "Retry empty exports"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+            {"category": "Added", "text": "Group changes by category"},
+        ])
+        template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]}]}
+        checklist = {"version": "2.0.0", "items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"}]}
+        result = self.desk.migrate_checklist("2.0.0", "2.0.1", checklist, template)
+        self.assertEqual(result["retained"], ["fixed"])
+        # A shared text in another category never pairs against Fixed.
+        self.desk.add("2.0.2", [
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+            {"category": "Added", "text": "Retry empty exports"},
+            {"category": "Added", "text": "Group changes by category"},
+        ])
+        checklist = {"version": "2.0.0", "items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"}]}
+        result = self.desk.migrate_checklist("2.0.0", "2.0.2", checklist, template)
+        self.assertEqual(result["reset"], ["fixed"])
+
+    def test_multi_category_item_compares_every_declared_category(self):
+        # Changed is absent from both sides of a same-version migration: equal
+        # empty categories keep the item.
+        template = {"items": [
+            {"id": "scope", "text": "Scope", "required": True,
+             "categories": ["Fixed", "Changed"]}]}
+        checklist = {"version": "1.1.0", "items": [
+            {"id": "scope", "text": "Scope", "required": True, "status": "done"}]}
+        result = self.desk.migrate_checklist("1.1.0", "1.1.0", checklist, template)
+        self.assertEqual(result["retained"], ["scope"])
+        # A new Changed entry in the target resets even though Fixed is equal.
+        self.desk.add("1.4.0", [
+            {"category": "Added", "text": "Group changes by category"},
+            {"category": "Fixed", "text": "Preserve Unicode titles"},
+            {"category": "Changed", "text": "Sort versions"},
+        ])
+        result = self.desk.migrate_checklist("1.1.0", "1.4.0", checklist, template)
+        self.assertEqual(result["reset"], ["scope"])
+
+    def test_text_and_required_changes_reset_regardless_of_entries(self):
+        checklist = self.checklist()
+        text_change = {"items": [
+            {"id": "fixed", "text": "Verify the fix now", "required": True, "categories": ["Fixed"]}]}
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", checklist, text_change)
+        self.assertEqual(result["reset"], ["fixed"])
+        self.assertEqual(result["removed"], ["docs", "added", "legacy"])
+        self.assertEqual(result["items"][0],
+                         {"id": "fixed", "text": "Verify the fix now", "required": True,
+                          "status": "pending"})
+        required_flip = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": False, "categories": ["Fixed"]}]}
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", checklist, required_flip)
+        self.assertEqual(result["reset"], ["docs", "fixed"])
+        self.assertEqual(result["items"][1],
+                         {"id": "fixed", "text": "Verify fix", "required": False, "status": "pending"})
+
+    def test_same_version_and_reverse_order(self):
+        template = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+        ]}
+        checklist = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "blocked"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+        ]}
+        same = self.desk.migrate_checklist("1.2.0", "1.2.0", checklist, template)
+        self.assertEqual(same["baseVersion"], "1.2.0")
+        self.assertEqual(same["version"], "1.2.0")
+        self.assertEqual(same["retained"], ["docs", "fixed"])
+        self.assertEqual([item["status"] for item in same["items"]], ["blocked", "done"])
+        # Reverse order keeps progress only for the unchanged Fixed category.
+        reverse = self.desk.migrate_checklist("1.2.0", "1.1.0", checklist, self.template())
+        self.assertEqual(reverse["retained"], ["fixed"])
+        self.assertEqual(reverse["reset"], ["docs"])
+        self.assertEqual(reverse["added"], ["added"])
+
+    def test_empty_arrays_present_when_nothing_changes(self):
+        template = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+        ]}
+        checklist = {"version": "1.1.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+        ]}
+        # Same-version migration compares a release with itself: identical
+        # definitions and identical entries keep every status.
+        result = self.desk.migrate_checklist("1.1.0", "1.1.0", checklist, template)
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_result_feeds_check_and_audit_for_target_version(self):
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        report = self.desk.checklist("1.2.0", result)
+        self.assertEqual(set(report), {"version", "ready", "done", "pending", "blocked"})
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["done"]], ["fixed"])
+        audit = self.desk.audit_checklist("1.2.0", result, self.template())
+        self.assertEqual(audit["missing"], [])
+        self.assertEqual(audit["mismatched"], [])
+        self.assertEqual(audit["unexpected"], [])
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.1.0", result)
+
+    def test_dropped_template_items_still_validated_but_removed(self):
+        # Target 1.1.0 has no Changed category: the Changed template item is
+        # filtered out, and old items missing from the selection are removed.
+        template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "changed", "text": "Explain changes", "required": False, "categories": ["Changed"]},
+        ]}
+        checklist = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "legacy", "text": "Legacy", "required": False, "status": "done"},
+        ]}
+        result = self.desk.migrate_checklist("1.2.0", "1.1.0", checklist, template)
+        self.assertEqual([item["id"] for item in result["items"]], ["fixed"])
+        self.assertEqual(result["removed"], ["docs", "legacy"])
+        # The filtered-out template item is still fully validated.
+        bad_template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "changed", "text": "Line\nbreak", "required": False, "categories": ["Changed"]},
+        ]}
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.2.0", "1.1.0", checklist, bad_template)
+
+    def test_ids_trimmed_case_sensitive_no_unicode_normalization(self):
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        self.assertEqual(result["items"][1]["id"], "fixed")
+        upper = self.checklist()
+        upper["items"][1]["id"] = "FIXED"
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", upper, self.template())
+        self.assertIn("fixed", result["added"])
+        self.assertIn("FIXED", result["removed"])
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        template = {"items": [{"id": composed, "text": "Cafe", "required": True}]}
+        checklist = {"version": "1.1.0", "items": [
+            {"id": decomposed, "text": "Cafe", "required": True, "status": "done"}]}
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", checklist, template)
+        self.assertEqual(result["added"], [composed])
+        self.assertEqual(result["removed"], [decomposed])
+
+    def test_invalid_versions_and_unknown_releases(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.migrate_checklist(version, "1.2.0", self.checklist(), self.template())
+            with self.assertRaises(ValueError):
+                self.desk.migrate_checklist("1.1.0", version, self.checklist(), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("9.9.9", "1.2.0", self.checklist(), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "9.9.9", self.checklist(), self.template())
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        self.assertFalse(missing.path.parent.exists())
+
+    def test_checklist_version_must_match_base(self):
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0",
+                                        self.checklist(version="1.2.0"), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0",
+                                        self.checklist(version="1.3.0"), self.template())
+
+    def test_invalid_checklist_and_template(self):
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0",
+                                        {"version": "1.1.0", "items": []}, self.template())
+        optional = {"version": "1.1.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": False, "status": "done"}]}
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", optional, self.template())
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), {"items": []})
+        template = self.template()
+        template["items"][0]["id"] = "fixed"
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), template)
+
+    def test_empty_selection_and_no_required_rejected(self):
+        checklist_120 = self.checklist(version="1.2.0")
+        only_changed = {"items": [
+            {"id": "c", "text": "C", "required": True, "categories": ["Changed"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.2.0", "1.1.0", checklist_120, only_changed)
+        no_required = {"items": [
+            {"id": "docs", "text": "Write notes", "required": False},
+            {"id": "fixed", "text": "Verify fix", "required": False, "categories": ["Fixed"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), no_required)
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.1.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        self.assertEqual(self.path.read_bytes(), raw)
+        raw = b'{"1.1.0": [], "1.1.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.migrate_checklist("1.1.0", "1.2.0", self.checklist(), self.template())
+
+    def test_readonly_and_inputs_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist, template = self.checklist(), self.template()
+        snapshot = json.loads(json.dumps({"checklist": checklist, "template": template}))
+        result = self.desk.migrate_checklist("1.1.0", "1.2.0", checklist, template)
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual({"checklist": checklist, "template": template}, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        # Mutating the result never reaches the passed inputs.
+        result["items"][0]["text"] = "mutated"
+        result["items"].append({"id": "x"})
+        result["retained"].append("x")
+        self.assertEqual(checklist["items"][0]["text"], "Write notes")
+        self.assertEqual(len(template["items"]), 4)
+
+    def test_cli_migrate_checklist(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["migrate-checklist", "1.1.0", "1.2.0", str(checklist), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload, {
+            "baseVersion": "1.1.0",
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+                {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+                {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+                {"id": "changed", "text": "Explain changes", "required": False, "status": "pending"},
+            ],
+            "retained": ["fixed"],
+            "reset": ["docs", "added"],
+            "added": ["changed"],
+            "removed": ["legacy"],
+        })
+        # The migrated checklist is accepted by check and audit-checklist.
+        migrated = Path(self.temp.name) / "migrated.json"
+        migrated.write_text(result.stdout, encoding="utf-8")
+        checked = subprocess.run(prefix + ["check", "1.2.0", str(migrated)],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        audited = subprocess.run(
+            prefix + ["audit-checklist", "1.2.0", str(migrated), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        report = json.loads(audited.stdout)
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["mismatched"], [])
+        self.assertEqual(report["unexpected"], [])
+
+    def test_cli_migrate_checklist_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            json.dumps({"version": "1.2.0", "items": [
+                {"id": "a", "text": "A", "required": True, "status": "done"}]}),
+            '{"version": "1.1.0", "version": "1.1.0", "items": []}',
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                checklist.write_bytes(case)
+            else:
+                checklist.write_text(case, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["migrate-checklist", "1.1.0", "1.2.0", str(checklist), str(template)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        duplicate_template = '{"items": [{"id": "a", "id": "a", "text": "A", "required": true}]}'
+        template.write_text(duplicate_template, encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["migrate-checklist", "1.1.0", "1.2.0", str(checklist), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout), {"error": "duplicate JSON object key"})
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        for base, target in (("v1", "1.2.0"), ("1.1.0", "9.9.9")):
+            result = subprocess.run(
+                prefix + ["migrate-checklist", base, target, str(checklist), str(template)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        absent = subprocess.run(
+            prefix + ["migrate-checklist", "1.1.0", "1.2.0",
+                      str(Path(self.temp.name) / "nope.json"), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(json.loads(checklist.read_text(encoding="utf-8")), self.checklist())
+        # A missing store is treated as empty, fails as unknown, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+             "migrate-checklist", "1.1.0", "1.2.0", str(checklist), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 class ConfigDiffTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
