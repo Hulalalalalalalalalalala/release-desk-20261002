@@ -1404,5 +1404,341 @@ class AuditChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ReconcileChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Retry empty exports"}])
+
+    def template(self, **overrides):
+        data = {
+            "items": [
+                {"id": "docs", "text": " Write notes ", "required": True},
+                {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+                {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def checklist(self, **overrides):
+        data = {
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+                {"id": "fixed", "text": "Verify fix", "required": True, "status": "blocked"},
+            ],
+        }
+        data.update(overrides)
+        return data
+
+    def test_retained_reset_added_removed_classification(self):
+        checklist = self.checklist()
+        checklist["items"].append({"id": "legacy", "text": "Legacy", "required": False, "status": "done"})
+        template = {"items": [
+            {"id": "gate", "text": "Gate build", "required": True},
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify the fix now", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", checklist, template)
+        self.assertEqual(set(result), {"version", "items", "retained", "reset", "added", "removed"})
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertEqual(result["items"], [
+            {"id": "gate", "text": "Gate build", "required": True, "status": "pending"},
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify the fix now", "required": True, "status": "pending"},
+        ])
+        self.assertEqual(result["retained"], ["docs"])
+        self.assertEqual(result["reset"], ["fixed"])
+        self.assertEqual(result["added"], ["gate"])
+        self.assertEqual(result["removed"], ["legacy"])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_reorder_only_keeps_statuses(self):
+        template = {"items": [
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "docs", "text": "Write notes", "required": True},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", self.checklist(), template)
+        self.assertEqual([item["id"] for item in result["items"]], ["fixed", "docs"])
+        self.assertEqual(result["items"][0]["status"], "blocked")
+        self.assertEqual(result["items"][1]["status"], "done")
+        self.assertEqual(result["retained"], ["fixed", "docs"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_text_and_required_changes_reset_to_new_definition(self):
+        text_change = {"items": [
+            {"id": "docs", "text": "Write release notes", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", self.checklist(), text_change)
+        self.assertEqual(result["reset"], ["docs"])
+        self.assertEqual(result["items"][0],
+                         {"id": "docs", "text": "Write release notes", "required": True, "status": "pending"})
+        required_flip = {"items": [
+            {"id": "docs", "text": "Write notes", "required": False},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", self.checklist(), required_flip)
+        self.assertEqual(result["reset"], ["docs"])
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual(result["items"][0],
+                         {"id": "docs", "text": "Write notes", "required": False, "status": "pending"})
+        self.assertEqual(result["items"][1]["status"], "blocked")
+
+    def test_added_items_pending_and_removed_orders(self):
+        checklist = self.checklist()
+        checklist["items"] = [
+            {"id": "legacy", "text": "Legacy", "required": True, "status": "done"},
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "done"},
+            {"id": "gone", "text": "Gone", "required": False, "status": "blocked"},
+        ]
+        template = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", checklist, template)
+        self.assertEqual(result["added"], ["fixed"])
+        self.assertEqual(result["removed"], ["legacy", "added", "gone"])
+        self.assertEqual(result["retained"], ["docs"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual([item["id"] for item in result["items"]], ["docs", "fixed"])
+        self.assertEqual(result["items"][1]["status"], "pending")
+
+    def test_identical_template_retains_everything_with_empty_arrays(self):
+        result = self.desk.reconcile_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual([item["id"] for item in result["items"]], ["docs", "fixed"])
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+
+    def test_template_status_ignored_and_status_not_inferred(self):
+        template = {"items": [
+            {"id": "docs", "text": "Write notes differently", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done", "categories": ["Fixed"]},
+            {"id": "gate", "text": "Gate", "required": True, "status": "done"},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", self.checklist(), template)
+        self.assertEqual(result["items"][0]["status"], "pending")
+        self.assertEqual(result["items"][1]["status"], "blocked")
+        self.assertEqual(result["items"][2]["status"], "pending")
+        self.assertEqual(result["reset"], ["docs"])
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual(result["added"], ["gate"])
+
+    def test_ids_trimmed_case_sensitive_no_unicode_normalization(self):
+        checklist = self.checklist()
+        checklist["items"][0]["id"] = " docs "
+        result = self.desk.reconcile_checklist("1.2.0", checklist, self.template())
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        upper = self.checklist()
+        upper["items"][1]["id"] = "FIXED"
+        result = self.desk.reconcile_checklist("1.2.0", upper, self.template())
+        self.assertEqual(result["added"], ["fixed"])
+        self.assertEqual(result["removed"], ["FIXED"])
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        template = {"items": [{"id": composed, "text": "Cafe", "required": True}]}
+        checklist = {"version": "1.2.0", "items": [
+            {"id": decomposed, "text": "Cafe", "required": True, "status": "done"}]}
+        result = self.desk.reconcile_checklist("1.2.0", checklist, template)
+        self.assertEqual(result["added"], [composed])
+        self.assertEqual(result["removed"], [decomposed])
+
+    def test_result_feeds_check_and_audit(self):
+        checklist = self.checklist()
+        template = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify the fix", "required": True, "categories": ["Fixed"]},
+            {"id": "gate", "text": "Gate", "required": False},
+        ]}
+        result = self.desk.reconcile_checklist("1.2.0", checklist, template)
+        report = self.desk.checklist("1.2.0", result)
+        self.assertEqual(set(report), {"version", "ready", "done", "pending", "blocked"})
+        self.assertFalse(report["ready"])
+        self.assertEqual([item["id"] for item in report["done"]], ["docs"])
+        self.assertEqual([item["id"] for item in report["pending"]], ["fixed", "gate"])
+        audit = self.desk.audit_checklist("1.2.0", result, template)
+        self.assertEqual(audit["missing"], [])
+        self.assertEqual(audit["mismatched"], [])
+        self.assertEqual(audit["unexpected"], [])
+        self.assertFalse(audit["ready"])
+        done = dict(result)
+        done["items"] = [dict(item, status="done") for item in result["items"]]
+        self.assertTrue(self.desk.audit_checklist("1.2.0", done, template)["ready"])
+
+    def test_invalid_version_unknown_release_and_mismatch(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.reconcile_checklist(version, self.checklist(), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("9.9.9", self.checklist(), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.0.0", self.checklist(), self.template())
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.reconcile_checklist("1.2.0", self.checklist(), self.template())
+        self.assertFalse(missing.path.parent.exists())
+
+    def test_invalid_checklist_and_template(self):
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", {"version": "1.2.0", "items": []}, self.template())
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(version="1.3.0"), self.template())
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), {"items": []})
+        # A checklist that is all optional is invalid on its own, even when the
+        # new template would reset or drop every item.
+        optional = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": False, "status": "done"}]}
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", optional, self.template())
+        # Template items the filter would drop are still fully validated.
+        template = self.template()
+        template["items"][2]["text"] = "A\nB"
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), template)
+
+    def test_empty_selection_and_no_required_rejected(self):
+        only_added = {"items": [
+            {"id": "a", "text": "A", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), only_added)
+        no_required = {"items": [
+            {"id": "docs", "text": "Write notes", "required": False},
+            {"id": "fixed", "text": "Verify fix", "required": False, "categories": ["Fixed"]}]}
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), no_required)
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual(self.path.read_bytes(), raw)
+        raw = b'{"1.2.0": [], "1.2.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), self.template())
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.reconcile_checklist("1.2.0", self.checklist(), self.template())
+
+    def test_readonly_and_inputs_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist, template = self.checklist(), self.template()
+        snapshot = json.loads(json.dumps({"checklist": checklist, "template": template}))
+        result = self.desk.reconcile_checklist("1.2.0", checklist, template)
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual({"checklist": checklist, "template": template}, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_reconcile_checklist(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        old = self.checklist()
+        old["items"].append({"id": "legacy", "text": "Legacy", "required": False, "status": "done"})
+        checklist.write_text(json.dumps(old), encoding="utf-8")
+        new_template = {"items": [
+            {"id": "docs", "text": "Write notes", "required": True},
+            {"id": "fixed", "text": "Verify the fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+        ]}
+        template.write_text(json.dumps(new_template), encoding="utf-8")
+        result = subprocess.run(prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload, {
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+                {"id": "fixed", "text": "Verify the fix", "required": True, "status": "pending"},
+            ],
+            "retained": ["docs"],
+            "reset": ["fixed"],
+            "added": [],
+            "removed": ["legacy"],
+        })
+        # The reconciled checklist is accepted by check and audit-checklist.
+        updated = Path(self.temp.name) / "updated.json"
+        updated.write_text(result.stdout, encoding="utf-8")
+        checked = subprocess.run(prefix + ["check", "1.2.0", str(updated)], capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertFalse(json.loads(checked.stdout)["ready"])
+        audited = subprocess.run(prefix + ["audit-checklist", "1.2.0", str(updated), str(template)],
+                                 capture_output=True, text=True)
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        report = json.loads(audited.stdout)
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["mismatched"], [])
+        self.assertEqual(report["unexpected"], [])
+
+    def test_cli_reconcile_checklist_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            json.dumps({"version": "2.0.0", "items": [
+                {"id": "a", "text": "A", "required": True, "status": "done"}]}),
+            '{"version": "1.2.0", "version": "1.2.0", "items": []}',
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                checklist.write_bytes(case)
+            else:
+                checklist.write_text(case, encoding="utf-8")
+            result = subprocess.run(prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        duplicate_template = '{"items": [{"id": "a", "id": "a", "text": "A", "required": true}]}'
+        template.write_text(duplicate_template, encoding="utf-8")
+        result = subprocess.run(prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout), {"error": "duplicate JSON object key"})
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        for version in ("v1", "9.9.9"):
+            result = subprocess.run(prefix + ["reconcile-checklist", version, str(checklist), str(template)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        absent = subprocess.run(
+            prefix + ["reconcile-checklist", "1.2.0", str(Path(self.temp.name) / "nope.json"), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # Input files are never modified.
+        self.assertEqual(json.loads(checklist.read_text(encoding="utf-8")), self.checklist())
+        # A missing store is treated as empty, fails as unknown, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        result = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "reconcile-checklist", "1.2.0", str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

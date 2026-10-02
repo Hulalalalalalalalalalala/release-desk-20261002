@@ -241,6 +241,41 @@ class ReleaseDesk:
                 "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"],
                 "missing": missing, "mismatched": mismatched, "unexpected": unexpected}
 
+    def reconcile_checklist(self, version, checklist, template):
+        # Read-only update of a same-version checklist against a revised
+        # template: unchanged definitions keep their status, redefined items
+        # reset to pending, new items are added and inapplicable items drop.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        template_items = self._validated_template(template)
+        # The whole store is validated before the version is looked up.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(template_items, records[version])
+        # Ids match case-sensitively after trimming, without Unicode normalization.
+        previous = {item["id"]: item for item in items}
+        reconciled, retained, reset, added = [], [], [], []
+        for expected in selected:
+            item_id = expected["id"]
+            actual = previous.get(item_id)
+            if actual is None:
+                reconciled.append(dict(expected))
+                added.append(item_id)
+            elif actual["text"] != expected["text"] or actual["required"] != expected["required"]:
+                # A redefined item takes the new definition and returns to pending.
+                reconciled.append(dict(expected))
+                reset.append(item_id)
+            else:
+                reconciled.append({"id": item_id, "text": expected["text"],
+                                   "required": expected["required"], "status": actual["status"]})
+                retained.append(item_id)
+        selected_ids = {item["id"] for item in selected}
+        removed = [item["id"] for item in items if item["id"] not in selected_ids]
+        return {"version": version, "items": reconciled,
+                "retained": retained, "reset": reset, "added": added, "removed": removed}
+
     @staticmethod
     def _applicable_template_items(items, changes):
         present = {change["category"] for change in changes}
@@ -464,6 +499,10 @@ def main():
     audit.add_argument("version")
     audit.add_argument("checklist")
     audit.add_argument("template")
+    reconcile = commands.add_parser("reconcile-checklist")
+    reconcile.add_argument("version")
+    reconcile.add_argument("checklist")
+    reconcile.add_argument("template")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -502,6 +541,16 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
                 result = desk.audit_checklist(args.version, checklist_payload, template_payload)
+            elif args.command == "reconcile-checklist":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                result = desk.reconcile_checklist(args.version, checklist_payload, template_payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
