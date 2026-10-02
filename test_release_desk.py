@@ -2303,5 +2303,293 @@ class ConfigPreviewTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ConfigResolveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        self.desk.add("2.0.0", [{"category": "Fixed", "text": "Two"}])
+
+    def resolve(self, base, target, current, decisions, base_version="1.0.0", target_version="2.0.0"):
+        return self.desk.resolve_config(base_version, target_version, base, target, current, decisions)
+
+    def conflict_paths(self, base, target, current):
+        preview = self.desk.preview_config("1.0.0", "2.0.0", base, target, current)
+        return [entry["path"] for entry in preview["conflicts"]]
+
+    def test_report_shape_empty_decisions_matches_preview(self):
+        base = {"port": 80}, {"port": 8080}, {"port": 9000}
+        result = self.resolve(*base, {})
+        self.assertEqual(set(result), {"baseVersion", "targetVersion", "canApply",
+                                       "config", "conflicts", "resolved"})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9000})
+        self.assertEqual(result["resolved"], [])
+        preview = self.desk.preview_config("1.0.0", "2.0.0", *base)
+        self.assertEqual(result["config"], preview["config"])
+        self.assertEqual(result["conflicts"], preview["conflicts"])
+
+    def test_choose_target_adopts_full_target_state(self):
+        result = self.resolve({"port": 80}, {"port": 8080}, {"port": 9000}, {"/port": "target"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["config"], {"port": 8080})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "target"}])
+
+    def test_choose_current_keeps_current_state(self):
+        result = self.resolve({"port": 80}, {"port": 8080}, {"port": 9000}, {"/port": "current"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9000})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "current"}])
+
+    def test_missing_chosen_side_deletes_field(self):
+        # Target deletes a field the current side edited: choosing target drops it.
+        target_delete = self.resolve({"a": 1, "k": 9}, {"a": 1}, {"a": 1, "k": 2},
+                                     {"/k": "target"})
+        self.assertEqual(target_delete["config"], {"a": 1})
+        self.assertTrue(target_delete["canApply"])
+        # Current lacks a field the plan changed: choosing current leaves it absent.
+        current_missing = self.resolve({"a": 1}, {"a": 2}, {}, {"/a": "current"})
+        self.assertEqual(current_missing["config"], {})
+        self.assertTrue(current_missing["canApply"])
+
+    def test_null_side_value_is_kept_as_value(self):
+        result = self.resolve({"a": 1}, {"a": None}, {"a": 2}, {"/a": "target"})
+        self.assertIn("a", result["config"])
+        self.assertIsNone(result["config"]["a"])
+        self.assertTrue(result["canApply"])
+
+    def test_partial_choices_leave_remaining_conflicts(self):
+        base = {"port": 80, "timeout": 30, "note": "x"}
+        target = {"port": 8080, "timeout": 3, "note": "y"}
+        current = {"port": 9000, "timeout": 60, "note": "x"}
+        self.assertEqual(self.conflict_paths(base, target, current), ["/port", "/timeout"])
+        result = self.resolve(base, target, current, {"/port": "target"})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"port": 8080, "timeout": 60, "note": "y"})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/timeout"])
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "target"}])
+
+    def test_unrelated_changes_and_independent_edits_kept(self):
+        result = self.resolve(
+            {"port": 80, "timeout": 30},
+            {"port": 8080, "timeout": 30},
+            {"port": 9000, "timeout": 60, "mine": True},
+            {"/port": "target"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 8080, "timeout": 60, "mine": True})
+
+    def test_arrays_type_changes_and_whole_objects_decided_as_whole(self):
+        array_result = self.resolve({"l": [1]}, {"l": [1, 2]}, {"l": [1, 3]}, {"/l": "target"})
+        self.assertEqual(array_result["config"], {"l": [1, 2]})
+        type_result = self.resolve({"a": 1}, {"a": {"x": 1}}, {"a": 2}, {"/a": "current"})
+        self.assertEqual(type_result["config"], {"a": 2})
+        object_result = self.resolve({}, {"o": {"x": 1}}, {"o": 2}, {"/o": "target"})
+        self.assertEqual(object_result["config"], {"o": {"x": 1}})
+
+    def test_subpaths_of_whole_conflicts_are_unknown_paths(self):
+        base, target, current = {"db": {"port": 1}}, {"db": [1]}, {"db": {"port": 2}}
+        self.assertEqual(self.conflict_paths(base, target, current), ["/db"])
+        with self.assertRaises(ValueError):
+            self.resolve(base, target, current, {"/db/port": "target"})
+
+    def test_nested_conflict_decided_independently(self):
+        base = {"db": {"host": "h", "port": 1}}
+        target = {"db": {"host": "h2", "port": 2}}
+        current = {"db": {"host": "C", "port": 3}}
+        result = self.resolve(base, target, current, {"/db/host": "target", "/db/port": "current"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"db": {"host": "h2", "port": 3}})
+        paths = [entry["path"] for entry in result["resolved"]]
+        self.assertEqual(paths, ["/db/host", "/db/port"])
+
+    def test_paths_matched_verbatim_with_pointer_escaping(self):
+        base = {"a~b": 1, "a/b": 1, "": 1}
+        target = {"a~b": 2, "a/b": 2, "": 2}
+        current = {"a~b": 3, "a/b": 3, "": 3}
+        result = self.resolve(base, target, current,
+                              {"/a~0b": "target", "/a~1b": "current", "/": "target"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a~b": 2, "a/b": 3, "": 2})
+        for raw in ("/a~b", "/a/b", "", " ", "/a~0b "):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, {raw: "target"})
+
+    def test_conflicts_and_resolved_sorted_by_unicode_code_point(self):
+        keys = ["", "a~b", "a/b", "z", "A", "中"]
+        base = {key: 0 for key in keys}
+        target = {key: 1 for key in keys}
+        current = {key: 2 for key in keys}
+        decisions = {"/" + key.replace("~", "~0").replace("/", "~1"): "target" for key in keys[:3]}
+        result = self.resolve(base, target, current, decisions)
+        resolved_paths = [entry["path"] for entry in result["resolved"]]
+        conflict_paths = [entry["path"] for entry in result["conflicts"]]
+        self.assertEqual(resolved_paths, sorted(resolved_paths))
+        self.assertEqual(conflict_paths, sorted(conflict_paths))
+        self.assertEqual(len(conflict_paths), 3)
+
+    def test_invalid_decisions(self):
+        base, target, current = {"a": 1}, {"a": 2}, {"a": 3}
+        for decisions in ([], None, "x", 1, True):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, decisions)
+        with self.assertRaises(ValueError):
+            self.resolve(base, target, current, {1: "target"})
+        for choice in ("yes", "", "TARGET", "Current", None, 0, True, ["target"]):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, {"/a": choice})
+        for path in ("/b", "/a/x", "", "a", "/a/"):
+            with self.assertRaises(ValueError):
+                self.resolve(base, target, current, {path: "target"})
+
+    def test_versions_store_and_configs_validated_like_preview(self):
+        good = {"a": 1}
+        for base_version, target_version in ((None, "1.0.0"), ("v1", "1.0.0"),
+                                             ("9.9.9", "1.0.0"), ("1.0.0", "9.9.9")):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_config(base_version, target_version, good, good, good, {})
+        for bad in (None, [], "x", 1, True, {1: "x"}, {"a": float("nan")}, {"a": object()}):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_config("1.0.0", "2.0.0", bad, good, good, {})
+            with self.assertRaises(ValueError):
+                self.desk.resolve_config("1.0.0", "2.0.0", good, bad, good, {})
+            with self.assertRaises(ValueError):
+                self.desk.resolve_config("1.0.0", "2.0.0", good, good, bad, {})
+        raw = b'{"1.0.0": [], "1.0.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.resolve(good, good, good, {})
+
+    def test_same_version_and_reverse_order_allowed(self):
+        same = self.resolve({"a": 1}, {"a": 2}, {"a": 3}, {"/a": "target"}, "1.0.0", "1.0.0")
+        self.assertEqual(same["config"], {"a": 2})
+        reverse = self.resolve({"a": 2}, {"a": 1}, {"a": 3}, {"/a": "current"}, "2.0.0", "1.0.0")
+        self.assertEqual(reverse["config"], {"a": 3})
+
+    def test_readonly_inputs_store_untouched_and_results_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        base = {"port": 80, "gone": {"a": [1]}}
+        target = {"port": 8080, "gone": {"a": [2]}}
+        current = {"port": 9000, "gone": {"a": [3]}}
+        decisions = {"/port": "target", "/gone/a": "current"}
+        snapshots = [json.loads(json.dumps(payload)) for payload in (base, target, current)]
+        result = self.resolve(base, target, current, dict(decisions))
+        self.assertTrue(result["canApply"])
+        self.assertEqual(base, snapshots[0])
+        self.assertEqual(target, snapshots[1])
+        self.assertEqual(current, snapshots[2])
+        self.assertEqual(decisions, {"/port": "target", "/gone/a": "current"})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        # Mutating the result never reaches the input objects.
+        result["config"]["gone"]["a"].append(4)
+        self.assertEqual(current["gone"]["a"], [3])
+
+    def test_cli_resolve_config(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        current_file = Path(self.temp.name) / "current.json"
+        decisions_file = Path(self.temp.name) / "decisions.json"
+        base_file.write_text(json.dumps({"port": 80, "timeout": 30}), encoding="utf-8")
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 30}), encoding="utf-8")
+        current_file.write_text(json.dumps({"port": 9000, "timeout": 60}), encoding="utf-8")
+        decisions_file.write_text(json.dumps({"/port": "target"}), encoding="utf-8")
+        result = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                          str(base_file), str(target_file),
+                                          str(current_file), str(decisions_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "baseVersion": "1.0.0", "targetVersion": "2.0.0", "canApply": True,
+            "config": {"port": 8080, "timeout": 60},
+            "conflicts": [], "resolved": [{"path": "/port", "choice": "target"}]})
+        # A target that also changes timeout leaves one unchosen conflict.
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 3}), encoding="utf-8")
+        partial = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                           str(base_file), str(target_file),
+                                           str(current_file), str(decisions_file)],
+                                 capture_output=True, text=True)
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+        payload = json.loads(partial.stdout)
+        self.assertFalse(payload["canApply"])
+        self.assertEqual([entry["path"] for entry in payload["conflicts"]], ["/timeout"])
+        # Empty decisions are valid and still exit 0.
+        decisions_file.write_text("{}", encoding="utf-8")
+        empty = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                         str(base_file), str(target_file),
+                                         str(current_file), str(decisions_file)],
+                               capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(json.loads(empty.stdout)["resolved"], [])
+
+    def test_cli_resolve_config_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        current_file = Path(self.temp.name) / "current.json"
+        decisions_file = Path(self.temp.name) / "decisions.json"
+        good = json.dumps({"a": 1})
+        cases = [
+            ("{not json",),
+            (b"\xff\xfe",),
+            ('{"x": 1, "x": 2}',),
+            (json.dumps([1, 2]),),
+            (json.dumps(None),),
+            (json.dumps({"/a": "yes"}),),
+            (json.dumps({"/b": "target"}),),
+        ]
+        base_file.write_text(good, encoding="utf-8")
+        target_file.write_text(json.dumps({"a": 2}), encoding="utf-8")
+        current_file.write_text(json.dumps({"a": 3}), encoding="utf-8")
+        for (raw,) in cases:
+            if isinstance(raw, bytes):
+                decisions_file.write_bytes(raw)
+            else:
+                decisions_file.write_text(raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                             str(base_file), str(target_file),
+                                             str(current_file), str(decisions_file)],
+                                   capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        # A missing decisions file fails with OSError and creates nothing.
+        missing = Path(self.temp.name) / "nope.json"
+        failed = subprocess.run(prefix + ["resolve-config", "1.0.0", "2.0.0",
+                                         str(base_file), str(target_file),
+                                         str(current_file), str(missing)],
+                               capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        self.assertFalse(missing.exists())
+        # Bad versions fail like preview-config.
+        decisions_file.write_text("{}", encoding="utf-8")
+        for arguments in (
+            ["resolve-config", "v1", "2.0.0", str(base_file), str(target_file),
+             str(current_file), str(decisions_file)],
+            ["resolve-config", "1.0.0", "9.9.9", str(base_file), str(target_file),
+             str(current_file), str(decisions_file)],
+        ):
+            failed = subprocess.run(prefix + arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty, reports unknown versions, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "resolve-config", "1.0.0", "2.0.0",
+                                 str(base_file), str(target_file),
+                                 str(current_file), str(decisions_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "unknown release"})
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

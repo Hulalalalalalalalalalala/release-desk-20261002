@@ -1,5 +1,6 @@
 """Store releases and render change notes grouped by category."""
 import argparse
+import copy
 import json
 import math
 import os
@@ -160,6 +161,43 @@ def _preview_config_values(base, target, current, path, conflicts):
 
 def _version_order(version):
     return tuple(map(int, version.split(".")))
+
+
+def _resolve_config_values(base, target, current, path, choices, resolved):
+    # Three-way merge mirroring _preview_config_values, applying confirmed
+    # whole-field choices at conflict paths. All values are traversed
+    # read-only; the returned object is built from deep copies.
+    resolved_config = {}
+    for key in base.keys() | target.keys() | current.keys():
+        child_path = path + "/" + _escape_pointer_token(key)
+        bp, tp, cp = key in base, key in target, key in current
+        bv, tv, cv = base.get(key), target.get(key), current.get(key)
+        if _present_equal(bp, bv, tp, tv):
+            if cp:
+                resolved_config[key] = copy.deepcopy(cv)
+        elif _present_equal(cp, cv, tp, tv):
+            if cp:
+                resolved_config[key] = copy.deepcopy(cv)
+        elif _present_equal(cp, cv, bp, bv):
+            if tp:
+                resolved_config[key] = copy.deepcopy(tv)
+        elif bp and tp and cp and isinstance(bv, dict) and isinstance(tv, dict) and isinstance(cv, dict):
+            resolved_config[key] = _resolve_config_values(
+                bv, tv, cv, child_path, choices, resolved)
+        else:
+            choice = choices.get(child_path)
+            if choice is None:
+                # Unresolved conflict: keep the current presence state and value.
+                if cp:
+                    resolved_config[key] = copy.deepcopy(cv)
+            else:
+                side = tv if choice == "target" else cv
+                present = tp if choice == "target" else cp
+                resolved.append({"path": child_path, "choice": choice})
+                if present:
+                    # A null side value is kept as a value, not a missing field.
+                    resolved_config[key] = copy.deepcopy(side)
+    return resolved_config
 
 
 def _atomic_write(path, content):
@@ -646,6 +684,50 @@ class ReleaseDesk:
         return {"baseVersion": base_version, "targetVersion": target_version,
                 "canApply": not conflicts, "config": preview, "conflicts": conflicts}
 
+    def resolve_config(self, base_version, target_version, base_config, target_config,
+                       current_config, decisions):
+        # Read-only three-way resolution with per-path conflict choices. The
+        # decisions map original preview_config conflict paths verbatim to
+        # "target" or "current"; nothing is stored or inferred from entries.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        _validated_config(base_config)
+        _validated_config(target_config)
+        _validated_config(current_config)
+        if not isinstance(decisions, dict):
+            raise ValueError("decisions must be a JSON object")
+        for path, choice in decisions.items():
+            if not isinstance(path, str):
+                raise ValueError("decision keys must be strings")
+            if choice not in ("target", "current"):
+                raise ValueError("decision choice must be target or current")
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        conflicts = []
+        _preview_config_values(base_config, target_config, current_config, "", conflicts)
+        conflict_paths = {entry["path"] for entry in conflicts}
+        # Keys match the original conflict paths verbatim, using the same JSON
+        # Pointer escaping: no trimming, normalization or subpath selection.
+        for path in decisions:
+            if path not in conflict_paths:
+                raise ValueError("decision path is not a conflict path")
+        resolved = []
+        config = _resolve_config_values(
+            base_config, target_config, current_config, "", decisions, resolved)
+        chosen_paths = {entry["path"] for entry in resolved}
+        remaining = [entry for entry in conflicts if entry["path"] not in chosen_paths]
+        # Paths sort by Unicode code point, not by locale.
+        remaining.sort(key=lambda entry: entry["path"])
+        resolved.sort(key=lambda entry: entry["path"])
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "canApply": not remaining, "config": config,
+                "conflicts": remaining, "resolved": resolved}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -676,6 +758,13 @@ def main():
     preview_config.add_argument("base_config")
     preview_config.add_argument("target_config")
     preview_config.add_argument("current_config")
+    resolve_config = commands.add_parser("resolve-config")
+    resolve_config.add_argument("base_version")
+    resolve_config.add_argument("target_version")
+    resolve_config.add_argument("base_config")
+    resolve_config.add_argument("target_config")
+    resolve_config.add_argument("current_config")
+    resolve_config.add_argument("decisions")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -732,6 +821,26 @@ def main():
                     raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
                 result = desk.preview_config(args.base_version, args.target_version,
                                              base_payload, target_payload, current_payload)
+            elif args.command == "resolve-config":
+                try:
+                    base_payload = _loads_unique(Path(args.base_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_payload = _loads_unique(Path(args.target_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    current_payload = _loads_unique(Path(args.current_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    decisions_payload = _loads_unique(Path(args.decisions).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("decisions file must contain UTF-8 encoded JSON") from exc
+                result = desk.resolve_config(args.base_version, args.target_version,
+                                             base_payload, target_payload, current_payload,
+                                             decisions_payload)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
