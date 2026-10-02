@@ -3735,6 +3735,319 @@ class UpdateChecklistTests(unittest.TestCase):
         self.assertEqual(self.checklist.read_bytes(), before)
 
 
+class PreviewUpdateChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+        self.checklist = Path(self.temp.name) / "checklist.json"
+
+    def write_checklist(self, items=None, version="1.2.0", raw=None):
+        if raw is not None:
+            self.checklist.write_bytes(raw)
+            return
+        if items is None:
+            items = [
+                {"id": "docs", "text": " Write notes ", "required": True, "status": "done"},
+                {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+                {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"},
+            ]
+        self.checklist.write_text(json.dumps({"version": version, "items": items}), encoding="utf-8")
+
+    def test_preview_shape_and_planned_result(self):
+        self.write_checklist()
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "blocked", "status": "pending"}], self.checklist)
+        self.assertEqual(set(result),
+                         {"version", "canUpdate", "changed", "items", "updated",
+                          "ready", "conflicts"})
+        self.assertTrue(result["canUpdate"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["conflicts"], [])
+        # updated follows checklist order, not updates-argument order.
+        self.assertEqual(result["updated"], ["sign", "nice"])
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "done"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "pending"}])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_preview_never_writes_even_when_changes_planned(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        mtime = self.checklist.stat().st_mtime_ns
+        store_before = self.path.read_bytes()
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"}], self.checklist)
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.checklist.read_bytes(), before)
+        self.assertEqual(self.checklist.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+    def test_preview_empty_batch_validates_store_and_checklist(self):
+        self.write_checklist()
+        result = self.desk.preview_update_checklist("1.2.0", [], self.checklist)
+        self.assertTrue(result["canUpdate"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["done", "pending", "blocked"])
+        self.write_checklist(version="1.0.0")
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [], self.checklist)
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("9.9.9", [], self.checklist)
+
+    def test_preview_conflicts_reported_in_updates_order(self):
+        self.write_checklist()
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nope", "expected": "pending", "status": "done"},
+            {"id": "docs", "expected": "blocked", "status": "pending"},
+            {"id": " also-missing ", "expected": "done", "status": "blocked"}], self.checklist)
+        self.assertFalse(result["canUpdate"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["conflicts"], [
+            {"id": "nope", "expected": "pending", "actual": None,
+             "status": "done", "reason": "unknown-id"},
+            {"id": "docs", "expected": "blocked", "actual": "done",
+             "status": "pending", "reason": "status-mismatch"},
+            {"id": "also-missing", "expected": "done", "actual": None,
+             "status": "blocked", "reason": "unknown-id"}])
+        for conflict in result["conflicts"]:
+            self.assertEqual(set(conflict), {"id", "expected", "actual", "status", "reason"})
+        # The otherwise-valid first update is not applied: items are the
+        # normalized original checklist and ready reflects it.
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"}])
+        self.assertFalse(result["ready"])
+
+    def test_preview_ready_reflects_original_even_with_conflict(self):
+        self.write_checklist([
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "pending"}])
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "nice", "expected": "done", "status": "done"}], self.checklist)
+        self.assertFalse(result["canUpdate"])
+        self.assertEqual(result["conflicts"][0]["reason"], "status-mismatch")
+        # All required items are done in the untouched original checklist.
+        self.assertTrue(result["ready"])
+
+    def test_preview_satisfied_target_still_checks_expected(self):
+        self.write_checklist()
+        # Wrong expected although actual already equals the target status.
+        mismatch = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "docs", "expected": "blocked", "status": "done"}], self.checklist)
+        self.assertFalse(mismatch["canUpdate"])
+        self.assertEqual(mismatch["conflicts"], [
+            {"id": "docs", "expected": "blocked", "actual": "done",
+             "status": "done", "reason": "status-mismatch"}])
+        # Correct expected with an already-satisfied target plans no change.
+        steady = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "docs", "expected": "done", "status": "done"}], self.checklist)
+        self.assertTrue(steady["canUpdate"])
+        self.assertFalse(steady["changed"])
+        self.assertEqual(steady["updated"], [])
+        self.assertEqual(steady["conflicts"], [])
+
+    def test_preview_matches_write_plan(self):
+        self.write_checklist()
+        updates = [
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "blocked", "status": "pending"}]
+        preview = self.desk.preview_update_checklist("1.2.0", updates, self.checklist)
+        written = self.desk.update_checklist("1.2.0", updates, self.checklist)
+        self.assertEqual(preview["items"], written["items"])
+        self.assertEqual(preview["updated"], written["updated"])
+        self.assertEqual(preview["ready"], written["ready"])
+        self.assertEqual(preview["changed"], written["changed"])
+
+    def test_preview_inputs_untouched_and_result_detached(self):
+        self.write_checklist()
+        updates = [{"id": "sign", "expected": "pending", "status": "done"}]
+        snapshot = json.loads(json.dumps(updates))
+        result = self.desk.preview_update_checklist("1.2.0", updates, self.checklist)
+        result["items"][1]["status"] = "blocked"
+        result["conflicts"].append({"id": "x"})
+        self.assertEqual(updates, snapshot)
+        again = self.desk.preview_update_checklist("1.2.0", updates, self.checklist)
+        self.assertEqual(again["items"][1]["status"], "done")
+        self.assertEqual(again["conflicts"], [])
+
+    def test_preview_invalid_structures_and_duplicate_ids_raise(self):
+        self.write_checklist()
+        good = {"id": "docs", "expected": "done", "status": "pending"}
+        cases = [
+            None, {}, "x", 1,
+            [None], [{}],
+            [{"id": "docs", "expected": "done"}],
+            [{"id": "docs", "expected": "done", "status": "pending", "extra": 1}],
+            [{**good, "id": None}], [{**good, "id": "  "}], [{**good, "id": "a\nb"}],
+            [{**good, "expected": "DONE"}], [{**good, "status": None}],
+        ]
+        for updates in cases:
+            with self.assertRaises(ValueError, msg=repr(updates)):
+                self.desk.preview_update_checklist("1.2.0", updates, self.checklist)
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [
+                {"id": " docs ", "expected": "done", "status": "pending"},
+                {"id": "docs", "expected": "done", "status": "blocked"}], self.checklist)
+
+    def test_preview_invalid_versions_raise(self):
+        self.write_checklist()
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.preview_update_checklist(version, [], self.checklist)
+
+    def test_preview_bad_checklist_bytes_raise_and_preserve_file(self):
+        for raw in (b"{not json", b"\xff\xfe",
+                    b'{"version": "1.2.0", "version": "1.2.0", "items": []}',
+                    b"[1, 2]", b"null", b"",
+                    json.dumps({"version": "1.2.0", "items": []}).encode("utf-8")):
+            self.write_checklist(raw=raw)
+            with self.assertRaises(ValueError, msg=raw):
+                self.desk.preview_update_checklist("1.2.0", [], self.checklist)
+            self.assertEqual(self.checklist.read_bytes(), raw)
+
+    def test_preview_path_rules_match_write(self):
+        self.write_checklist()
+        missing = Path(self.temp.name) / "no-dir" / "checklist.json"
+        with self.assertRaises(OSError):
+            self.desk.preview_update_checklist("1.2.0", [], missing)
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+        link = Path(self.temp.name) / "link.json"
+        link.symlink_to(self.checklist)
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [], link)
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [], self.path)
+        alias = Path(self.temp.name) / ".." / Path(self.temp.name).name / "releases.json"
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [], alias)
+        hard = Path(self.temp.name) / "hard.json"
+        os.link(self.path, hard)
+        with self.assertRaises(ValueError):
+            self.desk.preview_update_checklist("1.2.0", [], hard)
+
+    def test_preview_missing_store_treated_as_empty(self):
+        desk = ReleaseDesk(Path(self.temp.name) / "no-store" / "releases.json")
+        self.write_checklist()
+        with self.assertRaises(ValueError):
+            desk.preview_update_checklist("1.2.0", [], self.checklist)
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "update-checklist", *extra]
+
+    def test_cli_dry_run_plans_without_writing(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        mtime = self.checklist.stat().st_mtime_ns
+        updates_file = Path(self.temp.name) / "updates.json"
+        updates_file.write_text(json.dumps([
+            {"id": "sign", "expected": "pending", "status": "done"}]), encoding="utf-8")
+        result = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist), "--dry-run"),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report),
+                         {"version", "canUpdate", "changed", "items", "updated",
+                          "ready", "conflicts"})
+        self.assertTrue(report["canUpdate"])
+        self.assertTrue(report["changed"])
+        self.assertEqual(report["updated"], ["sign"])
+        self.assertEqual(report["conflicts"], [])
+        self.assertEqual(self.checklist.read_bytes(), before)
+        self.assertEqual(self.checklist.stat().st_mtime_ns, mtime)
+        # The plan predicts the real write, which still requires no flag.
+        written = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist)),
+            capture_output=True, text=True)
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual(set(json.loads(written.stdout)),
+                         {"version", "changed", "items", "updated", "ready"})
+        self.assertNotEqual(self.checklist.read_bytes(), before)
+
+    def test_cli_dry_run_conflicts_exit_0(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        updates_file = Path(self.temp.name) / "updates.json"
+        updates_file.write_text(json.dumps([
+            {"id": "nope", "expected": "pending", "status": "done"},
+            {"id": "docs", "expected": "blocked", "status": "pending"}]), encoding="utf-8")
+        result = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist), "--dry-run"),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["canUpdate"])
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["updated"], [])
+        self.assertEqual([c["reason"] for c in report["conflicts"]],
+                         ["unknown-id", "status-mismatch"])
+        self.assertIsNone(report["conflicts"][0]["actual"])
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_cli_dry_run_empty_batch_exit_0(self):
+        self.write_checklist()
+        updates_file = Path(self.temp.name) / "updates.json"
+        updates_file.write_text("[]", encoding="utf-8")
+        result = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist), "--dry-run"),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["canUpdate"])
+        self.assertEqual(report["conflicts"], [])
+
+    def test_cli_dry_run_errors_exit_2_and_write_nothing(self):
+        self.write_checklist()
+        before = self.checklist.read_bytes()
+        updates_file = Path(self.temp.name) / "updates.json"
+        cases = [
+            b"{not json",
+            b"\xff\xfe",
+            b'[{"id": "sign", "expected": "pending", "expected": "done", "status": "done"}]',
+            json.dumps({}).encode("utf-8"),
+            json.dumps([{"id": "sign", "expected": "weird", "status": "done"}]).encode("utf-8"),
+        ]
+        for raw in cases:
+            updates_file.write_bytes(raw)
+            failed = subprocess.run(
+                self.command("1.2.0", str(updates_file), str(self.checklist), "--dry-run"),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+            self.assertEqual(self.checklist.read_bytes(), before)
+        updates_file.write_text("[]", encoding="utf-8")
+        for arguments in (
+            self.command("v1", str(updates_file), str(self.checklist), "--dry-run"),
+            self.command("9.9.9", str(updates_file), str(self.checklist), "--dry-run"),
+            self.command("1.2.0", str(updates_file),
+                         str(Path(self.temp.name) / "missing" / "checklist.json"), "--dry-run"),
+            self.command("1.2.0", str(Path(self.temp.name) / "nope.json"),
+                         str(self.checklist), "--dry-run"),
+            self.command("1.2.0", str(self.checklist), str(self.checklist), "--dry-run"),
+        ):
+            failed = subprocess.run(arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+
 class ReleaseRecordTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
