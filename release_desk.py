@@ -175,6 +175,63 @@ class ReleaseDesk:
         return {"version": version, "ready": ready,
                 "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"]}
 
+    def generate_checklist(self, version, payload):
+        # Read-only checklist generated from a template: items are filtered by
+        # the change categories actually registered for the release.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_template(payload)
+        # The whole store is validated before the version is looked up.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        present = {change["category"] for change in records[version]}
+        selected = []
+        for item in items:
+            categories = item["categories"]
+            if categories is None or present.intersection(categories):
+                selected.append({"id": item["id"], "text": item["text"],
+                                 "required": item["required"], "status": "pending"})
+        if not selected:
+            raise ValueError("no template items apply to this release")
+        if not any(item["required"] for item in selected):
+            raise ValueError("checklist requires at least one required item")
+        return {"version": version, "items": selected}
+
+    @staticmethod
+    def _validated_template(payload):
+        if not isinstance(payload, dict):
+            raise ValueError("template must be a JSON object")
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("template requires at least one item")
+        normalized = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("template items require id, text and required")
+            item_id, text, required = item.get("id"), item.get("text"), item.get("required")
+            if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
+                raise ValueError("template item id must be a non-empty single-line string")
+            if not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
+                raise ValueError("template item text must be a non-empty single-line string")
+            if not isinstance(required, bool):
+                raise ValueError("template item required must be a boolean")
+            categories = item.get("categories")
+            if categories is not None:
+                if (not isinstance(categories, list) or not categories
+                        or any(category not in CATEGORIES for category in categories)
+                        or len(set(categories)) != len(categories)):
+                    raise ValueError("template item categories must be a non-empty array of unique known categories")
+            item_id = item_id.strip()
+            # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+            if item_id in seen:
+                raise ValueError("template item id must be unique")
+            seen.add(item_id)
+            normalized.append({"id": item_id, "text": text.strip(),
+                               "required": required, "categories": categories})
+        return normalized
+
     @staticmethod
     def _validated_checklist(payload, version):
         if not isinstance(payload, dict):
@@ -342,6 +399,9 @@ def main():
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
+    make_checklist = commands.add_parser("make-checklist")
+    make_checklist.add_argument("version")
+    make_checklist.add_argument("file")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -364,6 +424,12 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("check file must contain UTF-8 encoded JSON") from exc
                 result = desk.checklist(args.version, payload)
+            elif args.command == "make-checklist":
+                try:
+                    payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("template file must contain UTF-8 encoded JSON") from exc
+                result = desk.generate_checklist(args.version, payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
