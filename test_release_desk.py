@@ -4678,5 +4678,336 @@ class PreviewMergeChecklistTests(unittest.TestCase):
                           "current.json", "mismatched.json"})
 
 
+class ResolveMergeChecklistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+
+    @staticmethod
+    def payload(items, version="1.2.0"):
+        return {"version": version, "items": items}
+
+    def conflicting_inputs(self):
+        base = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+            {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+            {"id": "z", "text": "Zed", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+            {"id": "z", "text": "Zed", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+            {"id": "z", "text": "Zed", "required": True, "status": "done"},
+        ])
+        return base, incoming, current
+
+    def test_empty_decisions_reproduces_preview(self):
+        base, incoming, current = self.conflicting_inputs()
+        preview = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {})
+        self.assertEqual(set(result),
+                         {"version", "canMerge", "ready", "items", "conflicts", "resolved"})
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertFalse(result["canMerge"])
+        # The required conflict x keeps the blocked current status.
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["items"], preview["items"])
+        self.assertEqual(result["conflicts"], preview["conflicts"])
+        self.assertEqual(result["resolved"], [])
+
+    def test_partial_choices_adopt_whole_items(self):
+        base, incoming, current = self.conflicting_inputs()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"x": "incoming"})
+        self.assertFalse(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["items"], [
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+            {"id": "z", "text": "Zed", "required": True, "status": "done"}])
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "incoming"}])
+        self.assertEqual([entry["id"] for entry in result["conflicts"]], ["y"])
+        # The remaining conflict keeps the original preview structure.
+        conflict = result["conflicts"][0]
+        self.assertEqual(set(conflict), {"id", "base", "incoming", "current"})
+        self.assertIsNone(conflict["incoming"])
+        self.assertEqual(conflict["current"]["status"], "done")
+
+    def test_choosing_missing_side_deletes_item(self):
+        base, incoming, current = self.conflicting_inputs()
+        # Incoming lacks y: adopting the incoming side deletes it wholesale.
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"x": "incoming", "y": "incoming"})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual([item["id"] for item in result["items"]], ["x", "z"])
+        self.assertEqual([entry["id"] for entry in result["resolved"]], ["x", "y"])
+        self.assertEqual(result["conflicts"], [])
+        for item in result["items"]:
+            self.assertEqual(set(item), {"id", "text", "required", "status"})
+
+    def test_choosing_current_confirms_even_unchanged_content(self):
+        base, incoming, current = self.conflicting_inputs()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"x": "current", "y": "current"})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual(result["items"][0],
+                         {"id": "x", "text": "Xray", "required": True, "status": "blocked"})
+        # y exists on the current side, so confirming current keeps it.
+        self.assertEqual([item["id"] for item in result["items"]], ["x", "y", "z"])
+        self.assertEqual(result["resolved"],
+                         [{"id": "x", "choice": "current"},
+                          {"id": "y", "choice": "current"}])
+
+    def test_current_side_missing_item_confirmed_current_is_deleted(self):
+        # A current-side absence conflict: the current side edited another item
+        # and dropped this one; confirming current accepts the deletion.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        preview = self.desk.preview_merge_checklist("1.2.0", base, incoming, current)
+        self.assertEqual([entry["id"] for entry in preview["conflicts"]], ["r"])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"r": "current"})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual([item["id"] for item in result["items"]], ["a"])
+        self.assertEqual(result["resolved"], [{"id": "r", "choice": "current"}])
+
+    def test_incoming_only_items_append_in_incoming_order(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "n1", "text": "N1", "required": False, "status": "pending"},
+            {"id": "n2", "text": "N2", "required": False, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+        ])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"a": "incoming"})
+        self.assertEqual([item["id"] for item in result["items"]], ["a", "n1", "n2"])
+        self.assertTrue(result["ready"])
+
+    def test_arrays_sorted_by_id_code_point(self):
+        base = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "pending"},
+            {"id": "A", "text": "Ay", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "done"},
+            {"id": "A", "text": "Ay", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "b", "text": "Bee", "required": True, "status": "blocked"},
+            {"id": "A", "text": "Ay", "required": True, "status": "blocked"},
+        ])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"b": "incoming"})
+        self.assertEqual([entry["id"] for entry in result["conflicts"]], ["A"])
+        self.assertEqual(result["resolved"], [{"id": "b", "choice": "incoming"}])
+
+    def test_resolved_result_must_stay_a_legal_checklist(self):
+        # Each side lacks the other side's conflicting required item; choosing
+        # the missing side for both deletes every item.
+        base = self.payload([
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "r", "text": "R", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "A", "required": True, "status": "blocked"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current,
+                {"a": "incoming", "r": "current"})
+
+    def test_decisions_validation(self):
+        base, incoming, current = self.conflicting_inputs()
+        for decisions in ([], None, "x", 1, [{}]):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    "1.2.0", base, incoming, current, decisions)
+        # Keys must be strings and normalized conflict ids, matched exactly.
+        for decisions in ({1: "incoming"},
+                          {"x": "target"},
+                          {"z": "incoming"},
+                          {"X": "incoming"},
+                          {" x ": "incoming"},
+                          {"x": "incoming", "y": "sideways"},
+                          {"x": None},
+                          {"x": 0}):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    "1.2.0", base, incoming, current, decisions)
+        # A decision for an id that merges cleanly is not a conflict id.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {"z": "current"})
+
+    def test_checklist_and_store_validation_is_unchanged(self):
+        valid = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        for version in (None, "v1", "1.0", "9.9.9"):
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist(
+                    version, valid, valid, valid, {})
+        invalid = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "weird"},
+        ])
+        for position in range(3):
+            inputs = [valid, valid, valid]
+            inputs[position] = invalid
+            with self.assertRaises(ValueError):
+                self.desk.resolve_merge_checklist("1.2.0", *inputs, {})
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist("1.2.0", valid, valid, valid, {})
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        with self.assertRaises(ValueError):
+            desk.resolve_merge_checklist("1.2.0", valid, valid, valid, {})
+
+    def test_inputs_untouched_and_result_detached(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": "incoming"}
+        snapshot = json.loads(json.dumps([base, incoming, current, decisions]))
+        store_before = self.path.read_bytes()
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+        result["items"][0]["status"] = "pending"
+        result["resolved"][0]["choice"] = "current"
+        result["conflicts"][0]["current"]["status"] = "done"
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+        self.assertEqual(self.path.read_bytes(), store_before)
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "resolve-merge-checklist", *extra]
+
+    def write_files(self, base, incoming, current, decisions):
+        paths = []
+        for name, payload in (("base.json", base), ("incoming.json", incoming),
+                              ("current.json", current), ("decisions.json", decisions)):
+            path = Path(self.temp.name) / name
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def test_cli_resolve_merge_checklist_success(self):
+        base, incoming, current = self.conflicting_inputs()
+        paths = self.write_files(base, incoming, current, {"x": "incoming"})
+        decisions = paths[3]
+        before = [path.read_bytes() for path in paths] + [self.path.read_bytes()]
+        result = subprocess.run(
+            self.command("1.2.0", *map(str, paths)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report),
+                         {"version", "canMerge", "ready", "items", "conflicts", "resolved"})
+        self.assertFalse(report["canMerge"])
+        self.assertEqual([entry["id"] for entry in report["conflicts"]], ["y"])
+        self.assertEqual(report["resolved"], [{"id": "x", "choice": "incoming"}])
+        self.assertEqual(report["items"][0]["status"], "done")
+        self.assertEqual([path.read_bytes() for path in paths] + [self.path.read_bytes()],
+                         before)
+        # Empty decisions still exit 0 with conflicts remaining.
+        decisions.write_text("{}", encoding="utf-8")
+        empty = subprocess.run(
+            self.command("1.2.0", *map(str, paths)), capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        empty_report = json.loads(empty.stdout)
+        self.assertFalse(empty_report["canMerge"])
+        self.assertEqual(empty_report["resolved"], [])
+        self.assertEqual([entry["id"] for entry in empty_report["conflicts"]], ["x", "y"])
+
+    def test_cli_resolve_merge_checklist_errors(self):
+        base, incoming, current = self.conflicting_inputs()
+        base_path, incoming_path, current_path, decisions_path = self.write_files(
+            base, incoming, current, {})
+        before = [path.read_bytes() for path in
+                  (base_path, incoming_path, current_path, decisions_path, self.path)]
+        # Non-UTF-8 bytes, JSON syntax errors and duplicate keys at any level.
+        for raw in (b"\xff\xfe", b"{not json",
+                    b'{"x": "incoming", "x": "current"}'):
+            decisions_path.write_bytes(raw)
+            failed = subprocess.run(
+                self.command("1.2.0", str(base_path), str(incoming_path),
+                             str(current_path), str(decisions_path)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        # Bad decision content: non-object, illegal choice, non-conflict id.
+        for raw in ("[]", "null", json.dumps({"x": "target"}),
+                    json.dumps({"z": "incoming"}), json.dumps({"X": "incoming"})):
+            decisions_path.write_text(raw, encoding="utf-8")
+            failed = subprocess.run(
+                self.command("1.2.0", str(base_path), str(incoming_path),
+                             str(current_path), str(decisions_path)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertIn("error", json.loads(failed.stdout))
+        decisions_path.write_text("{}", encoding="utf-8")
+        # Duplicate keys inside one of the checklist files.
+        incoming_path.write_bytes(
+            b'{"version": "1.2.0", "items": [{"id": "x", "id": "y",'
+            b' "text": "T", "required": true, "status": "done"}]}')
+        failed = subprocess.run(
+            self.command("1.2.0", str(base_path), str(incoming_path),
+                         str(current_path), str(decisions_path)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        incoming_path.write_text(json.dumps(incoming), encoding="utf-8")
+        # Bad and unknown versions.
+        for version in ("v1", "9.9.9"):
+            failed = subprocess.run(
+                self.command(version, str(base_path), str(incoming_path),
+                             str(current_path), str(decisions_path)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, version)
+        # Missing checklist and decisions files fail without creating anything.
+        missing = Path(self.temp.name) / "missing.json"
+        failed = subprocess.run(
+            self.command("1.2.0", str(missing), str(incoming_path),
+                         str(current_path), str(decisions_path)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        failed = subprocess.run(
+            self.command("1.2.0", str(base_path), str(incoming_path),
+                         str(current_path), str(missing)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(missing.exists())
+        # Nothing was modified and no file or directory was created.
+        self.assertEqual([path.read_bytes() for path in
+                          (base_path, incoming_path, current_path,
+                           decisions_path, self.path)], before)
+        self.assertEqual({path.name for path in Path(self.temp.name).iterdir()},
+                         {"releases.json", "base.json", "incoming.json",
+                          "current.json", "decisions.json"})
+
+
 if __name__ == "__main__":
     unittest.main()

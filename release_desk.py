@@ -206,6 +206,22 @@ def _preview_config_values(base, target, current, path, conflicts):
     return preview
 
 
+def _validated_merge_choices(decisions):
+    # Validate the checklist conflict-choice map before it is applied: a JSON
+    # object, possibly empty, with string keys mapping only to "incoming" or
+    # "current". Membership against actual conflict ids is checked afterwards.
+    if not isinstance(decisions, dict):
+        raise ValueError("merge decisions must be a JSON object")
+    normalized = {}
+    for item_id, choice in decisions.items():
+        if not isinstance(item_id, str):
+            raise ValueError("decision keys must be strings")
+        if choice not in ("incoming", "current"):
+            raise ValueError("decision choice must be incoming or current")
+        normalized[item_id] = choice
+    return normalized
+
+
 def _version_order(version):
     return tuple(map(int, version.split(".")))
 
@@ -702,6 +718,71 @@ class ReleaseDesk:
         # current side keeps the current side; otherwise a current side equal
         # to the base adopts the incoming side; anything else is one whole-item
         # conflict that keeps the current presence state and content.
+        base_items, incoming_items, current_items = self._prepared_merge_inputs(
+            version, base, incoming, current)
+        merged, conflicts = self._merge_classification(
+            base_items, incoming_items, current_items)
+        items = self._ordered_merge_items(merged, incoming_items, current_items)
+        self._validate_merge_items(items)
+        ready = all(item["status"] == "done" for item in items if item["required"])
+        # Ids sort by Unicode code point, not by locale.
+        conflicts.sort(key=lambda entry: entry["id"])
+        return {"version": version, "canMerge": not conflicts, "ready": ready,
+                "items": items, "conflicts": conflicts}
+
+    def resolve_merge_checklist(self, version, base, incoming, current, decisions):
+        # Read-only confirmation layer over preview_merge_checklist: decisions
+        # maps original preview conflict ids to "incoming" or "current"; empty
+        # and partial maps are allowed. A chosen side is adopted as one whole
+        # item and choosing a side that lacks the id deletes the item.
+        # Unchosen conflicts keep their original details and the current side.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        base_items = self._validated_checklist(base, version)
+        incoming_items = self._validated_checklist(incoming, version)
+        current_items = self._validated_checklist(current, version)
+        choices = _validated_merge_choices(decisions)
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        merged, conflicts = self._merge_classification(
+            base_items, incoming_items, current_items)
+        # The original preview must itself stay a legal checklist before any
+        # decision is applied.
+        self._validate_merge_items(
+            self._ordered_merge_items(merged, incoming_items, current_items))
+        conflict_ids = {entry["id"] for entry in conflicts}
+        # Keys match the normalized conflict ids exactly: case-sensitive, with
+        # no trimming or Unicode normalization, and never at a non-conflict id.
+        for item_id in choices:
+            if item_id not in conflict_ids:
+                raise ValueError("decision id is not a conflict id")
+        resolved = [{"id": item_id, "choice": choice}
+                    for item_id, choice in choices.items()]
+        # Apply the confirmed whole-item choices over the preview plan. A side
+        # lacking the id deletes the item; building from deep copies keeps
+        # every passed object untouched, and confirming an unchanged current
+        # side still counts as resolved.
+        incoming_by_id = {item["id"]: item for item in incoming_items}
+        current_by_id = {item["id"]: item for item in current_items}
+        chosen_by_id = {entry["id"]: entry["choice"] for entry in resolved}
+        for item_id, choice in chosen_by_id.items():
+            side = incoming_by_id if choice == "incoming" else current_by_id
+            merged[item_id] = copy.deepcopy(side.get(item_id))
+        items = self._ordered_merge_items(merged, incoming_items, current_items)
+        self._validate_merge_items(items)
+        remaining = [entry for entry in conflicts if entry["id"] not in chosen_by_id]
+        ready = all(item["status"] == "done" for item in items if item["required"])
+        # Ids sort by Unicode code point, not by locale.
+        remaining.sort(key=lambda entry: entry["id"])
+        resolved.sort(key=lambda entry: entry["id"])
+        return {"version": version, "canMerge": not remaining, "ready": ready,
+                "items": items, "conflicts": remaining, "resolved": resolved}
+
+    def _prepared_merge_inputs(self, version, base, incoming, current):
+        # Shared version, checklist and store checks for the checklist merges.
         if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
             raise ValueError("version must have three nonnegative numeric components")
         base_items = self._validated_checklist(base, version)
@@ -712,6 +793,14 @@ class ReleaseDesk:
         records = self._read_store()
         if version not in records:
             raise ValueError("unknown release")
+        return base_items, incoming_items, current_items
+
+    @staticmethod
+    def _merge_classification(base_items, incoming_items, current_items):
+        # Whole-item three-way classification shared by the preview and its
+        # confirmation. merged maps every id to the kept item or None for a
+        # planned deletion; conflicts lists one original-detail entry per
+        # divergent id, and merged/conflict entries are detached copies.
         base_by_id = {item["id"]: item for item in base_items}
         incoming_by_id = {item["id"]: item for item in incoming_items}
         current_by_id = {item["id"]: item for item in current_items}
@@ -736,8 +825,13 @@ class ReleaseDesk:
                                   "incoming": dict(incoming_item) if incoming_item is not None else None,
                                   "current": dict(current_item) if current_item is not None else None})
                 merged[item_id] = current_item
-        # Items keep the current-side order, then preview items the current
-        # side lacks follow in incoming-side order.
+        return merged, conflicts
+
+    @staticmethod
+    def _ordered_merge_items(merged, incoming_items, current_items):
+        # Items keep the current-side order, then items the current side lacks
+        # follow in incoming-side order; deleted ids are omitted.
+        current_by_id = {item["id"]: item for item in current_items}
         items = []
         for item in current_items:
             kept = merged[item["id"]]
@@ -749,16 +843,15 @@ class ReleaseDesk:
                 kept = merged[item_id]
                 if kept is not None:
                     items.append(dict(kept))
-        # The merged preview must stay a legal checklist, conflicts or not.
+        return items
+
+    @staticmethod
+    def _validate_merge_items(items):
+        # The merged checklist must stay a legal checklist, conflicts or not.
         if not items:
             raise ValueError("checklist requires at least one item")
         if not any(item["required"] for item in items):
             raise ValueError("checklist requires at least one required item")
-        ready = all(item["status"] == "done" for item in items if item["required"])
-        # Ids sort by Unicode code point, not by locale.
-        conflicts.sort(key=lambda entry: entry["id"])
-        return {"version": version, "canMerge": not conflicts, "ready": ready,
-                "items": items, "conflicts": conflicts}
 
     def _prepare_checklist_update(self, version, updates, checklist_path):
         # Shared validation and reading for update_checklist and its preview:
@@ -1253,6 +1346,12 @@ def main():
     merge_checklist.add_argument("base")
     merge_checklist.add_argument("incoming")
     merge_checklist.add_argument("current")
+    resolve_merge_checklist = commands.add_parser("resolve-merge-checklist")
+    resolve_merge_checklist.add_argument("version")
+    resolve_merge_checklist.add_argument("base")
+    resolve_merge_checklist.add_argument("incoming")
+    resolve_merge_checklist.add_argument("current")
+    resolve_merge_checklist.add_argument("decisions")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -1445,6 +1544,26 @@ def main():
                     raise ValueError("current checklist file must contain UTF-8 encoded JSON") from exc
                 result = desk.preview_merge_checklist(args.version, base_payload,
                                                       incoming_payload, current_payload)
+            elif args.command == "resolve-merge-checklist":
+                try:
+                    base_payload = _loads_unique(Path(args.base).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    incoming_payload = _loads_unique(Path(args.incoming).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("incoming checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    current_payload = _loads_unique(Path(args.current).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("current checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    decisions_payload = _loads_unique(Path(args.decisions).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("decisions file must contain UTF-8 encoded JSON") from exc
+                result = desk.resolve_merge_checklist(
+                    args.version, base_payload, incoming_payload, current_payload,
+                    decisions_payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
