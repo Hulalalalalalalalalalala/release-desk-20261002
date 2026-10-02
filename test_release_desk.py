@@ -498,6 +498,163 @@ class ReleaseDeskTests(unittest.TestCase):
         self.assertFalse(absent.exists())
         self.assertFalse(absent.parent.exists())
 
+    def test_preview_imported_skipped_conflicts_sorted(self):
+        self.desk.add("1.1.0", [{"category": "Added", "text": "Existing"}])
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Two"}])
+        payload = {
+            "1.10.0": [{"category": "Added", "text": "Ten"}],
+            "1.2.0": [{"category": "Fixed", "text": "Changed"}],
+            "1.1.0": [{"category": "Added", "text": " Existing ", "extra": "ignored"}],
+            "1.0.0": [{"category": "Added", "text": "Base"}],
+        }
+        result = self.desk.preview_import_releases(payload)
+        self.assertEqual(result["imported"], ["1.0.0", "1.10.0"])
+        self.assertEqual(result["skipped"], ["1.1.0"])
+        self.assertEqual([detail["version"] for detail in result["conflicts"]], ["1.2.0"])
+        self.assertFalse(result["canImport"])
+        detail = result["conflicts"][0]
+        self.assertEqual(detail["added"], [{"category": "Fixed", "text": "Changed"}])
+        self.assertEqual(detail["removed"], [{"category": "Fixed", "text": "Two"}])
+        self.assertEqual(detail["unchanged"], [])
+        self.assertFalse(detail["orderOnly"])
+
+    def test_preview_can_import_and_empty_payload(self):
+        self.assertEqual(self.desk.preview_import_releases({}),
+                         {"imported": [], "skipped": [], "conflicts": [], "canImport": True})
+        self.assertFalse(self.path.exists())
+        result = self.desk.preview_import_releases({"1.0.0": [{"category": "Added", "text": "One"}]})
+        self.assertEqual(result, {"imported": ["1.0.0"], "skipped": [], "conflicts": [], "canImport": True})
+        self.assertFalse(self.path.exists())
+
+    def test_preview_conflict_detail_matches_diff_semantics(self):
+        self.desk.add("1.0.0", [
+            {"category": "Fixed", "text": "Retry"},
+            {"category": "Fixed", "text": "Retry"},
+            {"category": "Fixed", "text": "Gone"},
+            {"category": "Added", "text": "Old"},
+        ])
+        payload = {"1.0.0": [
+            {"category": "Fixed", "text": " Retry "},
+            {"category": "Fixed", "text": "New"},
+            {"category": "Added", "text": "Old"},
+            {"category": "Changed", "text": "中文 ✓"},
+        ]}
+        detail = self.desk.preview_import_releases(payload)["conflicts"][0]
+        self.assertEqual(detail["version"], "1.0.0")
+        self.assertEqual(detail["added"], [{"category": "Changed", "text": "中文 ✓"},
+                                           {"category": "Fixed", "text": "New"}])
+        self.assertEqual(detail["removed"], [{"category": "Fixed", "text": "Retry"},
+                                             {"category": "Fixed", "text": "Gone"}])
+        self.assertEqual(detail["unchanged"], [{"category": "Added", "text": "Old"},
+                                               {"category": "Fixed", "text": "Retry"}])
+        self.assertFalse(detail["orderOnly"])
+        for entry in detail["added"] + detail["removed"] + detail["unchanged"]:
+            self.assertEqual(set(entry), {"category", "text"})
+
+    def test_preview_order_only_conflict(self):
+        changes = [{"category": "Added", "text": "One"}, {"category": "Fixed", "text": "Two"}]
+        self.desk.add("1.0.0", changes)
+        reordered = {"1.0.0": [changes[1], changes[0]]}
+        detail = self.desk.preview_import_releases(reordered)["conflicts"][0]
+        self.assertTrue(detail["orderOnly"])
+        self.assertEqual(detail["added"], [])
+        self.assertEqual(detail["removed"], [])
+        self.assertEqual(detail["unchanged"], changes)
+        # Same multiset plus a real difference is not order-only.
+        different = {"1.0.0": [{"category": "Added", "text": "One"}, {"category": "Fixed", "text": "Two!"}]}
+        self.assertFalse(self.desk.preview_import_releases(different)["conflicts"][0]["orderOnly"])
+
+    def test_preview_readonly_and_input_untouched(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        payload = {"1.0.0": [{"category": "Added", "text": "Other"}], "2.0.0": [{"category": "Added", "text": " New ", "extra": 1}]}
+        snapshot = json.loads(json.dumps(payload))
+        result = self.desk.preview_import_releases(payload)
+        self.assertEqual(result["imported"], ["2.0.0"])
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(payload, snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.desk.versions(), ["1.0.0"])
+
+    def test_preview_validates_payload_and_store(self):
+        for payload in ([], {"v1": [{"category": "Added", "text": "x"}]}, {"1.0.0": []},
+                        {"1.0.0": [{"category": "Other", "text": "x"}]}):
+            with self.assertRaises(ValueError):
+                self.desk.preview_import_releases(payload)
+        # The whole store is validated even for an empty batch.
+        self.path.write_text(json.dumps({"9.9.9": []}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.preview_import_releases({})
+        raw = b'{"1.0.0": [], "1.0.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.preview_import_releases({})
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+        self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_preview_missing_store_and_oserror(self):
+        missing = Path(self.temp.name) / "no-dir" / "releases.json"
+        desk = ReleaseDesk(missing)
+        result = desk.preview_import_releases({"1.0.0": [{"category": "Added", "text": "One"}]})
+        self.assertEqual(result["imported"], ["1.0.0"])
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+        desk = ReleaseDesk(Path(self.temp.name))
+        with self.assertRaises(OSError):
+            desk.preview_import_releases({})
+
+    def test_cli_import_dry_run(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}, {"category": "Fixed", "text": "Two"}])
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        batch = Path(self.temp.name) / "batch.json"
+        batch.write_text(json.dumps({
+            "1.0.0": [{"category": "Fixed", "text": "Two"}, {"category": "Added", "text": "One"}],
+            "2.0.0": [{"category": "Added", "text": "New"}],
+        }), encoding="utf-8")
+        result = subprocess.run(prefix + ["import", "--dry-run", str(batch)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported"], ["2.0.0"])
+        self.assertEqual(payload["skipped"], [])
+        self.assertFalse(payload["canImport"])
+        self.assertEqual(len(payload["conflicts"]), 1)
+        self.assertTrue(payload["conflicts"][0]["orderOnly"])
+        # Conflicts do not block the preview and nothing is written.
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.desk.versions(), ["1.0.0"])
+
+    def test_cli_import_dry_run_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        batch = Path(self.temp.name) / "batch.json"
+        for raw in ("{not json", '{"1.0.0": [], "1.0.0": []}', '{"v1": []}'):
+            batch.write_text(raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["import", "--dry-run", str(batch)], capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        batch.write_bytes(b"\xff\xfe")
+        failed = subprocess.run(prefix + ["import", "--dry-run", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        missing = subprocess.run(prefix + ["import", "--dry-run", str(Path(self.temp.name) / "nope.json")], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(set(json.loads(missing.stdout)), {"error"})
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is not created, even on failure.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        batch.write_text('{"1.0.0": [], "1.0.0": []}', encoding="utf-8")
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "import", "--dry-run", str(batch)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "duplicate JSON object key"})
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,30 @@ class ReleaseDesk:
             self._write_store(records)
         return {"imported": imported, "skipped": skipped}
 
+    def preview_import_releases(self, payload):
+        # Read-only plan for import_releases: same validation and comparison,
+        # but conflicts are reported instead of raised and nothing is written.
+        incoming = self._validated_payload(payload)
+        records = self._read_store()
+        imported, skipped, conflicts = [], [], []
+        for version, changes in incoming.items():
+            if version not in records:
+                imported.append(version)
+                continue
+            existing = self._clean_changes(records[version])
+            if existing == changes:
+                skipped.append(version)
+                continue
+            added, removed, unchanged = self._diff_entries(existing, changes)
+            conflicts.append({"version": version, "added": added, "removed": removed,
+                              "unchanged": unchanged, "orderOnly": not added and not removed})
+        order = _version_order
+        imported.sort(key=order)
+        skipped.sort(key=order)
+        conflicts.sort(key=lambda detail: order(detail["version"]))
+        return {"imported": imported, "skipped": skipped,
+                "conflicts": conflicts, "canImport": not conflicts}
+
     def export_releases(self, versions=None):
         if versions is None:
             selected = None
@@ -202,6 +226,14 @@ class ReleaseDesk:
         records = self._read_store()
         base = self._checked_entries(records, base_version)
         target = self._checked_entries(records, target_version)
+        added, removed, unchanged = self._diff_entries(base, target)
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "added": added, "removed": removed, "unchanged": unchanged}
+
+    @staticmethod
+    def _diff_entries(base, target):
+        # Classify cleaned entries of target relative to base, per category in
+        # fixed order; duplicates pair up by occurrence within each category.
         added, removed, unchanged = [], [], []
         for category in CATEGORIES:
             base_entries = [entry for entry in base if entry["category"] == category]
@@ -219,8 +251,7 @@ class ReleaseDesk:
                     matched[entry["text"]] -= 1
                 else:
                     removed.append(entry)
-        return {"baseVersion": base_version, "targetVersion": target_version,
-                "added": added, "removed": removed, "unchanged": unchanged}
+        return added, removed, unchanged
 
     @staticmethod
     def _checked_entries(records, version):
@@ -238,7 +269,9 @@ def main():
     add.add_argument("changes")
     commands.add_parser("notes").add_argument("version")
     commands.add_parser("versions")
-    commands.add_parser("import").add_argument("file")
+    import_cmd = commands.add_parser("import")
+    import_cmd.add_argument("file")
+    import_cmd.add_argument("--dry-run", action="store_true", dest="dry_run")
     export = commands.add_parser("export")
     export.add_argument("--version", action="append", dest="versions")
     export.add_argument("--output")
@@ -258,7 +291,7 @@ def main():
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("import file must contain UTF-8 encoded JSON") from exc
-                result = desk.import_releases(payload)
+                result = desk.preview_import_releases(payload) if args.dry_run else desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
             elif args.command == "export":
