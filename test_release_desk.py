@@ -655,6 +655,162 @@ class ReleaseDeskTests(unittest.TestCase):
         self.assertFalse(store.exists())
         self.assertFalse(store.parent.exists())
 
+    def _checklist_payload(self):
+        return {
+            "version": "1.0.0",
+            "items": [
+                {"id": " docs ", "text": "Update guides", "required": False, "status": "pending", "extra": "ignored"},
+                {"id": "tests", "text": "Run tests", "required": True, "status": "done"},
+                {"id": "notes", "text": "Write notes", "required": True, "status": "done"},
+                {"id": "assets", "text": "Compress images", "required": False, "status": "blocked"},
+            ],
+        }
+
+    def test_checklist_ready_grouping_and_normalization(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        result = self.desk.checklist("1.0.0", self._checklist_payload())
+        # Optional items may be pending or blocked without affecting readiness.
+        self.assertEqual(result, {
+            "version": "1.0.0",
+            "ready": True,
+            "done": [
+                {"id": "tests", "text": "Run tests", "required": True, "status": "done"},
+                {"id": "notes", "text": "Write notes", "required": True, "status": "done"},
+            ],
+            "pending": [{"id": "docs", "text": "Update guides", "required": False, "status": "pending"}],
+            "blocked": [{"id": "assets", "text": "Compress images", "required": False, "status": "blocked"}],
+        })
+
+    def test_checklist_required_items_decide_readiness(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        for status in ("pending", "blocked"):
+            payload = {"version": "1.0.0", "items": [
+                {"id": "a", "text": "Same title", "required": True, "status": "done"},
+                {"id": "b", "text": "Same title", "required": True, "status": status},
+                {"id": "c", "text": "Same title", "required": False, "status": "done"},
+            ]}
+            result = self.desk.checklist("1.0.0", payload)
+            self.assertFalse(result["ready"])
+            self.assertEqual([item["id"] for item in result[status]], ["b"])
+
+    def test_checklist_validation_errors(self):
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        item = {"id": "a", "text": "Task", "required": True, "status": "done"}
+        invalid = [
+            ("v1", {"version": "v1", "items": [item]}),
+            (None, {"version": "1.0.0", "items": [item]}),
+            ("1.0.0", [{"version": "1.0.0", "items": [item]}]),
+            ("1.0.0", {"items": [item]}),
+            ("1.0.0", {"version": "1.0.0", "items": []}),
+            ("1.0.0", {"version": "1.0.0", "items": {}}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": False, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "", "text": "T", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "  ", "text": "T", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": 1, "text": "T", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a\nb", "text": "T", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a\rb", "text": "T", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": " ", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T\n", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": 1, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": "yes", "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": True, "status": "doing"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": True, "status": None}]}),
+            ("1.0.0", {"version": "1.0.0", "items": [item, {"id": " a ", "text": "U", "required": True, "status": "done"}]}),
+            ("1.0.0", {"version": "1.0.0", "items": ["x"]}),
+            ("1.0.0", {"version": "1.1.0", "items": [item]}),
+            ("1.0.0", {"version": "v1", "items": [item]}),
+        ]
+        for version, payload in invalid:
+            with self.assertRaises(ValueError, msg=(version, payload)):
+                self.desk.checklist(version, payload)
+        # Ids compare case-sensitively without Unicode normalization.
+        ok = {"version": "1.0.0", "items": [
+            {"id": "A", "text": "One", "required": True, "status": "done"},
+            {"id": "a", "text": "Two", "required": True, "status": "done"},
+            {"id": "é", "text": "Three", "required": True, "status": "done"},
+            {"id": "é", "text": "Four", "required": True, "status": "done"},
+        ]}
+        self.assertTrue(self.desk.checklist("1.0.0", ok)["ready"])
+
+    def test_checklist_store_handling_and_purity(self):
+        # A missing store is treated as empty and never created.
+        payload = self._checklist_payload()
+        snapshot = json.loads(json.dumps(payload))
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.0.0", payload)
+        self.assertFalse(self.path.exists())
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        self.desk.checklist("1.0.0", payload)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(payload, snapshot)
+        # The whole store is validated, not only the queried version.
+        self.path.write_text(json.dumps({
+            "1.0.0": [{"category": "Added", "text": "One"}],
+            "2.0.0": [{"category": "Other", "text": "Bad"}],
+        }), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.0.0", payload)
+        self.path.write_bytes(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            self.desk.checklist("1.0.0", payload)
+        desk = ReleaseDesk(Path(self.temp.name))
+        with self.assertRaises(OSError):
+            desk.checklist("1.0.0", payload)
+
+    def test_cli_check(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        checklist.write_text(json.dumps(self._checklist_payload(), ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run(prefix + ["check", "1.0.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(set(payload), {"version", "ready", "done", "pending", "blocked"})
+        self.assertTrue(payload["ready"])
+        # A valid but incomplete checklist still exits 0.
+        checklist.write_text(json.dumps({"version": "1.0.0", "items": [
+            {"id": "a", "text": "T", "required": True, "status": "pending"},
+        ]}), encoding="utf-8")
+        result = subprocess.run(prefix + ["check", "1.0.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["ready"])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_cli_check_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        for raw in ("{not json", '{"version": "1.0.0", "version": "1.0.0", "items": []}',
+                    '{"version": "9.9.9", "items": [{"id": "a", "text": "T", "required": true, "status": "done"}]}',
+                    '{"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": true, "status": "nope"}]}'):
+            checklist.write_text(raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["check", "1.0.0", str(checklist)], capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        checklist.write_bytes(b"\xff\xfe")
+        failed = subprocess.run(prefix + ["check", "1.0.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        missing = subprocess.run(prefix + ["check", "1.0.0", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(set(json.loads(missing.stdout)), {"error"})
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is reported as an unknown release and never created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        checklist.write_text('{"version": "1.0.0", "items": [{"id": "a", "text": "T", "required": true, "status": "done"}]}',
+                             encoding="utf-8")
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "check", "1.0.0", str(checklist)], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "unknown release"})
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

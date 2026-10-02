@@ -9,6 +9,8 @@ from pathlib import Path
 
 CATEGORIES = ("Added", "Changed", "Fixed")
 
+CHECK_STATUSES = ("done", "pending", "blocked")
+
 VERSION_PATTERN = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
 
 
@@ -152,6 +154,53 @@ class ReleaseDesk:
             ]
         return exported
 
+    def checklist(self, version, payload):
+        # Read-only readiness check: validates the payload and the whole store,
+        # then groups the normalized items by their declared status.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._clean_checklist(version, payload)
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        groups = {status: [] for status in CHECK_STATUSES}
+        for item in items:
+            groups[item["status"]].append(item)
+        ready = all(item["status"] == "done" for item in items if item["required"])
+        return {"version": version, "ready": ready, "done": groups["done"],
+                "pending": groups["pending"], "blocked": groups["blocked"]}
+
+    @staticmethod
+    def _clean_checklist(version, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("checklist must be a JSON object")
+        declared = payload.get("version")
+        if not isinstance(declared, str) or not re.fullmatch(VERSION_PATTERN, declared):
+            raise ValueError("version must have three nonnegative numeric components")
+        if declared != version:
+            raise ValueError("checklist version does not match the queried version")
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("checklist requires at least one required item")
+        clean, seen = [], set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("checklist items require id, text, required and status")
+            ident, text = item.get("id"), item.get("text")
+            required, status = item.get("required"), item.get("status")
+            if (not isinstance(ident, str) or not ident.strip() or "\n" in ident or "\r" in ident
+                    or not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text
+                    or not isinstance(required, bool) or status not in CHECK_STATUSES):
+                raise ValueError("checklist items require id, text, required and status")
+            ident, text = ident.strip(), text.strip()
+            if ident in seen:
+                raise ValueError("duplicate checklist item id")
+            seen.add(ident)
+            clean.append({"id": ident, "text": text, "required": required, "status": status})
+        if not any(item["required"] for item in clean):
+            raise ValueError("checklist requires at least one required item")
+        return clean
+
     @staticmethod
     def _clean_changes(changes):
         if not isinstance(changes, list) or not changes:
@@ -278,6 +327,9 @@ def main():
     diff = commands.add_parser("diff")
     diff.add_argument("base_version")
     diff.add_argument("target_version")
+    check = commands.add_parser("check")
+    check.add_argument("version")
+    check.add_argument("file")
     args = parser.parse_args()
     try:
         desk = ReleaseDesk(args.store)
@@ -294,6 +346,12 @@ def main():
                 result = desk.preview_import_releases(payload) if args.dry_run else desk.import_releases(payload)
             elif args.command == "diff":
                 result = desk.diff(args.base_version, args.target_version)
+            elif args.command == "check":
+                try:
+                    payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                result = desk.checklist(args.version, payload)
             elif args.command == "export":
                 result = desk.export_releases(args.versions)
                 if args.output:
