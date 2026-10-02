@@ -2016,5 +2016,330 @@ class ConfigDiffTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class PreviewConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        self.desk.add("2.0.0", [{"category": "Fixed", "text": "Two"}])
+
+    def test_independent_changes_both_kept(self):
+        # The plan changes the port; the current config only changes timeout.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0",
+            {"port": 80, "timeout": 10}, {"port": 8080, "timeout": 10},
+            {"port": 80, "timeout": 30})
+        self.assertEqual(set(result), {"baseVersion", "targetVersion", "canApply", "config", "conflicts"})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"port": 8080, "timeout": 30})
+        self.assertEqual(result["conflicts"], [])
+
+    def test_same_field_changed_differently_conflicts_and_keeps_current(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"port": 80}, {"port": 8080}, {"port": 9090})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"port": 9090})
+        self.assertEqual(result["conflicts"], [{"path": "/port",
+            "base": {"present": True, "value": 80},
+            "target": {"present": True, "value": 8080},
+            "current": {"present": True, "value": 9090}}])
+
+    def test_plan_unchanged_field_keeps_current_even_when_it_differs_from_base(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"a": 1, "b": 2}, {"a": 1, "b": 3}, {"a": 9, "b": 2})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 9, "b": 3})
+
+    def test_current_equals_target_keeps_target(self):
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": 1}, {"a": 2}, {"a": 2.0})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 2})
+
+    def test_current_equals_base_takes_target_with_additions_and_deletions(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"a": 1, "b": 2}, {"a": 3}, {"a": 1.0, "b": 2})
+        self.assertEqual(result["config"], {"a": 3})
+        result = self.desk.preview_config("1.0.0", "2.0.0", {}, {"a": None}, {})
+        self.assertEqual(result["config"], {"a": None})
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": None}, {}, {"a": None})
+        self.assertEqual(result["config"], {})
+
+    def test_current_only_additions_survive(self):
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": 1}, {"a": 1}, {"a": 1, "mine": [1, 2]})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 1, "mine": [1, 2]})
+
+    def test_recurse_when_all_three_are_objects(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0",
+            {"o": {"x": 1, "y": 1}}, {"o": {"x": 2, "y": 1}}, {"o": {"x": 1, "y": 3}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 2, "y": 3}})
+        # Target and current add different subfields; both appear.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"o": {}}, {"o": {"t": 1}}, {"o": {"c": 2}})
+        self.assertEqual(result["config"], {"o": {"t": 1, "c": 2}})
+
+    def test_nested_conflict_keeps_current_and_other_changes_apply(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0",
+            {"o": {"x": 1, "z": 1}, "p": 1},
+            {"o": {"x": 2, "z": 1}, "p": 2},
+            {"o": {"x": 3, "z": 1}, "p": 1})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 3, "z": 1}, "p": 2})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/o/x"])
+        self.assertEqual(result["conflicts"][0]["base"], {"present": True, "value": 1})
+        self.assertEqual(result["conflicts"][0]["target"], {"present": True, "value": 2})
+        self.assertEqual(result["conflicts"][0]["current"], {"present": True, "value": 3})
+
+    def test_arrays_and_type_changes_resolve_as_whole_values(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"a": [1]}, {"a": [1, 2]}, {"a": [1, 3]})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"a": [1, 3]})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/a"])
+        # No subpaths are listed for a whole-value conflict.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"a": {"x": 1}}, {"a": 5}, {"a": {"x": 2}})
+        self.assertEqual(result["config"], {"a": {"x": 2}})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/a"])
+
+    def test_add_or_remove_whole_subobject_is_one_judgement(self):
+        # The plan adds a subobject where current has a different subobject:
+        # absent on the base side, so the whole field conflicts, no subpaths.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {}, {"o": {"x": 1}}, {"o": {"x": 2}})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 2}})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/o"])
+        self.assertEqual(result["conflicts"][0]["base"], {"present": False})
+        # Same subobject independently added by both sides resolves cleanly.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {}, {"o": {"x": 1}}, {"o": {"x": 1}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 1}})
+        # The plan removes a subobject current still modified: whole conflict.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"o": {"x": 1}}, {}, {"o": {"x": 2}})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 2}})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/o"])
+        self.assertEqual(result["conflicts"][0]["target"], {"present": False})
+        # Current still at baseline, so the planned deletion applies.
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"o": {"x": 1}}, {}, {"o": {"x": 1}})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {})
+
+    def test_plan_removal_of_subfield_current_kept_is_conflict(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0", {"o": {"x": 1}}, {"o": {}}, {"o": {"x": 9}})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"o": {"x": 9}})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]], ["/o/x"])
+        conflict = result["conflicts"][0]
+        self.assertEqual(conflict["base"], {"present": True, "value": 1})
+        self.assertEqual(conflict["target"], {"present": False})
+        self.assertEqual(conflict["current"], {"present": True, "value": 9})
+
+    def test_missing_differs_from_null(self):
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": None}, {"a": 1}, {})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {})
+        self.assertEqual(result["conflicts"], [{"path": "/a",
+            "base": {"present": True, "value": None},
+            "target": {"present": True, "value": 1},
+            "current": {"present": False}}])
+        # Two missing sides count as equal: current missing survives silently.
+        result = self.desk.preview_config("1.0.0", "2.0.0", {}, {"a": 1}, {})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 1})
+
+    def test_scalar_semantics_follow_diff_config(self):
+        # Numerically equal int and float count as equal to the baseline.
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": 1}, {"a": 2}, {"a": 1.0})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 2})
+        # Booleans never equal numbers.
+        result = self.desk.preview_config("1.0.0", "2.0.0", {"a": 1}, {"a": 2}, {"a": True})
+        self.assertFalse(result["canApply"])
+        self.assertEqual(result["config"], {"a": True})
+
+    def test_conflicts_sorted_by_unicode_code_point_with_pointer_escaping(self):
+        result = self.desk.preview_config(
+            "1.0.0", "2.0.0",
+            {"": 1, "a~b": 1, "a/b": 1, "中": 1},
+            {"": 2, "a~b": 2, "a/b": 2, "中": 2},
+            {"": 3, "a~b": 3, "a/b": 3, "中": 3})
+        self.assertEqual([entry["path"] for entry in result["conflicts"]],
+                         ["/", "/a~0b", "/a~1b", "/中"])
+
+    def test_identical_configs_preview_current(self):
+        config = {"a": {"b": [1, True, None, "x"]}, "c": []}
+        result = self.desk.preview_config("1.0.0", "1.0.0", config, dict(config), dict(config))
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], config)
+        self.assertEqual(result["conflicts"], [])
+
+    def test_same_version_and_reverse_preview(self):
+        result = self.desk.preview_config(
+            "1.0.0", "1.0.0", {"a": 1}, {"a": 2}, {"a": 1})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 2})
+        result = self.desk.preview_config(
+            "2.0.0", "1.0.0", {"a": 2}, {"a": 1}, {"a": 2})
+        self.assertTrue(result["canApply"])
+        self.assertEqual(result["config"], {"a": 1})
+
+    def test_invalid_and_unknown_versions(self):
+        for base, target in ((None, "1.0.0"), ("v1", "1.0.0"), ("1.0", "1.0.0"),
+                             ("1.0.0.0", "1.0.0"), ("01.0.0", "1.0.0")):
+            with self.assertRaises(ValueError):
+                self.desk.preview_config(base, target, {}, {}, {})
+        for base, target in (("9.9.9", "1.0.0"), ("1.0.0", "9.9.9")):
+            with self.assertRaises(ValueError) as caught:
+                self.desk.preview_config(base, target, {}, {}, {})
+            self.assertEqual(str(caught.exception), "unknown release")
+
+    def test_invalid_store_still_rejected(self):
+        raw = json.dumps({"1.0.0": [{"category": "Added", "text": "One"}], "2.0.0": []}).encode()
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.preview_config("1.0.0", "2.0.0", {}, {}, {})
+        raw = b'{"1.0.0": [], "1.0.0": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError) as caught:
+            self.desk.preview_config("1.0.0", "2.0.0", {}, {}, {})
+        self.assertEqual(str(caught.exception), "duplicate JSON object key")
+
+    def test_missing_store_is_empty_and_unknown(self):
+        missing = Path(self.temp.name) / "no-dir" / "releases.json"
+        desk = ReleaseDesk(missing)
+        with self.assertRaises(ValueError):
+            desk.preview_config("1.0.0", "2.0.0", {}, {}, {})
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+
+    def test_all_three_configs_validated_by_existing_rules(self):
+        good = {"a": 1}
+        invalid = [None, [], "x", 1, True, [{}], {1: "x"},
+                   {"a": object()}, {"a": float("nan")}, {"a": float("inf")}]
+        for value in invalid:
+            with self.assertRaises(ValueError):
+                self.desk.preview_config("1.0.0", "2.0.0", value, good, good)
+            with self.assertRaises(ValueError):
+                self.desk.preview_config("1.0.0", "2.0.0", good, value, good)
+            with self.assertRaises(ValueError):
+                self.desk.preview_config("1.0.0", "2.0.0", good, good, value)
+        cycle = {"a": 1}
+        cycle["self"] = cycle
+        with self.assertRaises(ValueError):
+            self.desk.preview_config("1.0.0", "2.0.0", cycle, good, good)
+        with self.assertRaises(ValueError):
+            self.desk.preview_config("1.0.0", "2.0.0", good, cycle, good)
+        with self.assertRaises(ValueError):
+            self.desk.preview_config("1.0.0", "2.0.0", good, good, cycle)
+
+    def test_readonly_inputs_store_and_files_untouched(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        base = {"gone": {"a": [1]}, "v": 1, "o": {"x": 1}}
+        target = {"fresh": {"b": 2}, "v": 2, "o": {"x": 2}}
+        current = {"gone": {"a": [1]}, "v": 3, "o": {"x": 1}, "mine": True}
+        snapshots = [json.loads(json.dumps(payload)) for payload in (base, target, current)]
+        result = self.desk.preview_config("1.0.0", "2.0.0", base, target, current)
+        self.assertFalse(result["canApply"])
+        self.assertEqual(base, snapshots[0])
+        self.assertEqual(target, snapshots[1])
+        self.assertEqual(current, snapshots[2])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_preview_config(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        current_file = Path(self.temp.name) / "current.json"
+        base_file.write_text(json.dumps({"port": 80, "timeout": 10}), encoding="utf-8")
+        target_file.write_text(json.dumps({"port": 8080, "timeout": 10}), encoding="utf-8")
+        current_file.write_text(json.dumps({"port": 9090, "timeout": 30}), encoding="utf-8")
+        result = subprocess.run(prefix + ["preview-config", "1.0.0", "2.0.0",
+                                          str(base_file), str(target_file), str(current_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "baseVersion": "1.0.0", "targetVersion": "2.0.0", "canApply": False,
+            "config": {"port": 9090, "timeout": 30},
+            "conflicts": [{"path": "/port",
+                           "base": {"present": True, "value": 80},
+                           "target": {"present": True, "value": 8080},
+                           "current": {"present": True, "value": 9090}}]})
+        # No conflict: current changed only timeout.
+        current_file.write_text(json.dumps({"port": 80, "timeout": 30}), encoding="utf-8")
+        clean = subprocess.run(prefix + ["preview-config", "1.0.0", "2.0.0",
+                                         str(base_file), str(target_file), str(current_file)],
+                               capture_output=True, text=True)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        payload = json.loads(clean.stdout)
+        self.assertTrue(payload["canApply"])
+        self.assertEqual(payload["config"], {"port": 8080, "timeout": 30})
+        self.assertEqual(payload["conflicts"], [])
+
+    def test_cli_preview_config_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        base_file = Path(self.temp.name) / "base.json"
+        target_file = Path(self.temp.name) / "target.json"
+        current_file = Path(self.temp.name) / "current.json"
+        good = json.dumps({"a": 1})
+        cases = [
+            ("{not json", good, good),
+            (b"\xff\xfe", good, good),
+            (good, '{"a": 1, "a": 2}', good),
+            (good, good, '{"o": {"a": 1, "a": 2}}'),
+            (json.dumps([1, 2]), good, good),
+            (good, json.dumps({"a": float("nan")}), good),
+            (good, good, json.dumps(None)),
+        ]
+        for base_raw, target_raw, current_raw in cases:
+            if isinstance(base_raw, bytes):
+                base_file.write_bytes(base_raw)
+            else:
+                base_file.write_text(base_raw, encoding="utf-8")
+            target_file.write_text(target_raw, encoding="utf-8")
+            current_file.write_text(current_raw, encoding="utf-8")
+            failed = subprocess.run(prefix + ["preview-config", "1.0.0", "2.0.0",
+                                              str(base_file), str(target_file), str(current_file)],
+                                    capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, (base_raw, target_raw, current_raw))
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+        for arguments in (
+            ["preview-config", "v1", "2.0.0", str(base_file), str(target_file), str(current_file)],
+            ["preview-config", "1.0.0", "9.9.9", str(base_file), str(target_file), str(current_file)],
+            ["preview-config", "1.0.0", "2.0.0",
+             str(Path(self.temp.name) / "nope.json"), str(target_file), str(current_file)],
+        ):
+            base_file.write_text(good, encoding="utf-8")
+            target_file.write_text(good, encoding="utf-8")
+            current_file.write_text(good, encoding="utf-8")
+            failed = subprocess.run(prefix + arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertIn("error", json.loads(failed.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        # A missing store is treated as empty and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run([sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+                                 "preview-config", "1.0.0", "2.0.0",
+                                 str(base_file), str(target_file), str(current_file)],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
