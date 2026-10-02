@@ -3137,5 +3137,317 @@ class ConfigResolveTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ApplyConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [{"category": "Added", "text": "One"}])
+        self.desk.add("2.0.0", [{"category": "Fixed", "text": "Two"}])
+        self.current = Path(self.temp.name) / "current.json"
+
+    def write_current(self, payload=None, raw=None):
+        self.current.write_text(raw if raw is not None else json.dumps(payload),
+                                encoding="utf-8")
+
+    def apply(self, base, target, expected, decisions,
+              base_version="1.0.0", target_version="2.0.0", current_path=None):
+        return self.desk.apply_config(base_version, target_version, base, target,
+                                      expected, decisions,
+                                      current_path if current_path is not None else self.current)
+
+    def test_apply_writes_file_and_report_shape(self):
+        self.write_current({"port": 9000, "timeout": 60})
+        result = self.apply({"port": 80, "timeout": 30}, {"port": 8080, "timeout": 30},
+                            {"port": 9000, "timeout": 60}, {"/port": "target"})
+        self.assertEqual(set(result), {"baseVersion", "targetVersion",
+                                       "changed", "config", "resolved"})
+        self.assertEqual(result["baseVersion"], "1.0.0")
+        self.assertEqual(result["targetVersion"], "2.0.0")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["config"], {"port": 8080, "timeout": 60})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "target"}])
+        expected_content = json.dumps({"port": 8080, "timeout": 60},
+                                      ensure_ascii=False, indent=2) + "\n"
+        self.assertEqual(self.current.read_text(encoding="utf-8"), expected_content)
+
+    def test_no_change_keeps_bytes_and_mtime(self):
+        raw = '{"b": 1, "a": 2}'  # no trailing newline, unusual key order
+        self.write_current(raw=raw)
+        before, mtime = self.current.read_bytes(), self.current.stat().st_mtime_ns
+        # The plan changes nothing, so the resolved config equals the current one.
+        result = self.apply({"a": 2, "b": 1}, {"a": 2, "b": 1}, {"a": 2, "b": 1}, {})
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["config"], {"a": 2, "b": 1})
+        self.assertEqual(result["resolved"], [])
+        self.assertEqual(self.current.read_bytes(), before)
+        self.assertEqual(self.current.stat().st_mtime_ns, mtime)
+
+    def test_expected_snapshot_uses_semantic_equality(self):
+        self.write_current(raw='{"a": 1, "b": [2]}')
+        # Key order and numerically equal int/float pairs still match.
+        result = self.apply({"a": 1, "b": [2]}, {"a": 1, "b": [2]},
+                            {"b": [2.0], "a": 1.0}, {})
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.current.read_bytes(), b'{"a": 1, "b": [2]}')
+
+    def test_expected_mismatch_rejected_without_write(self):
+        self.write_current({"port": 9000})
+        before, mtime = self.current.read_bytes(), self.current.stat().st_mtime_ns
+        with self.assertRaises(ValueError):
+            self.apply({"port": 80}, {"port": 8080}, {"port": 80}, {"/port": "target"})
+        with self.assertRaises(ValueError):
+            self.apply({"port": 80}, {"port": 8080}, {"port": 9000, "extra": 1}, {})
+        self.assertEqual(self.current.read_bytes(), before)
+        self.assertEqual(self.current.stat().st_mtime_ns, mtime)
+
+    def test_unresolved_conflicts_rejected_without_write(self):
+        self.write_current({"port": 9000, "timeout": 60})
+        before = self.current.read_bytes()
+        with self.assertRaises(ValueError):
+            self.apply({"port": 80, "timeout": 30}, {"port": 8080, "timeout": 3},
+                       {"port": 9000, "timeout": 60}, {"/port": "target"})
+        with self.assertRaises(ValueError):
+            self.apply({"port": 80}, {"port": 8080}, {"port": 9000}, {})
+        self.assertEqual(self.current.read_bytes(), before)
+
+    def test_decisions_only_at_original_conflict_paths(self):
+        # No conflicts (the plan changes nothing): empty decisions are accepted.
+        self.write_current({"a": 1})
+        result = self.apply({"a": 1}, {"a": 1}, {"a": 1}, {})
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["resolved"], [])
+        # Decisions are only accepted at original conflict paths.
+        self.write_current({"port": 9000})
+        for decisions in ({"/other": "target"}, {"/port/x": "target"}, {"": "current"}):
+            with self.assertRaises(ValueError):
+                self.apply({"port": 80}, {"port": 8080}, {"port": 9000}, decisions)
+        # A subpath of a whole-value conflict is not a conflict path.
+        self.write_current({"db": {"port": 2}})
+        with self.assertRaises(ValueError):
+            self.apply({"db": {"port": 1}}, {"db": [1]}, {"db": {"port": 2}},
+                       {"/db/port": "target"})
+
+    def test_independent_edits_and_custom_decisions(self):
+        self.write_current({"port": 9000, "timeout": 60, "mine": True})
+        result = self.apply({"port": 80, "timeout": 30}, {"port": 8080, "timeout": 30},
+                            {"port": 9000, "timeout": 60, "mine": True},
+                            {"/port": {"present": True, "value": 9001}})
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["config"], {"port": 9001, "timeout": 60, "mine": True})
+        self.assertEqual(result["resolved"], [{"path": "/port", "choice": "custom"}])
+        on_disk = json.loads(self.current.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk, {"port": 9001, "timeout": 60, "mine": True})
+
+    def test_choose_current_and_deletions(self):
+        self.write_current({"port": 9000, "gone": 5})
+        result = self.apply({"port": 80, "gone": 1}, {"port": 8080},
+                            {"port": 9000, "gone": 5},
+                            {"/port": "current", "/gone": "target"})
+        self.assertEqual(result["config"], {"port": 9000})
+        self.assertEqual(result["resolved"], [{"path": "/gone", "choice": "target"},
+                                              {"path": "/port", "choice": "current"}])
+        self.assertEqual(json.loads(self.current.read_text(encoding="utf-8")),
+                         {"port": 9000})
+
+    def test_missing_target_symlink_and_store_same_file(self):
+        missing = Path(self.temp.name) / "missing" / "current.json"
+        with self.assertRaises(ValueError):
+            self.apply({"a": 1}, {"a": 2}, {"a": 1}, {}, current_path=missing)
+        self.assertFalse(missing.exists())
+        self.assertFalse(missing.parent.exists())
+        # A symlink target is rejected even when it resolves to a real file.
+        self.write_current({"a": 1})
+        link = Path(self.temp.name) / "link.json"
+        os.symlink(self.current, link)
+        with self.assertRaises(ValueError):
+            self.apply({"a": 1}, {"a": 2}, {"a": 1}, {}, current_path=link)
+        # The store itself, a hard link to it and a textual alias are rejected.
+        with self.assertRaises(ValueError):
+            self.apply({"a": 1}, {"a": 2}, {"a": 1}, {}, current_path=self.path)
+        hard = Path(self.temp.name) / "hard.json"
+        os.link(self.path, hard)
+        with self.assertRaises(ValueError):
+            self.apply({"a": 1}, {"a": 2}, {"a": 1}, {}, current_path=hard)
+        alias = Path(self.temp.name) / "sub" / ".." / "releases.json"
+        with self.assertRaises(ValueError):
+            self.apply({"a": 1}, {"a": 2}, {"a": 1}, {}, current_path=alias)
+        self.assertTrue(self.path.exists())
+
+    def test_invalid_versions_configs_decisions_and_store(self):
+        self.write_current({"a": 1})
+        good = {"a": 1}
+        for base_version, target_version in ((None, "1.0.0"), ("v1", "1.0.0"),
+                                             ("9.9.9", "1.0.0"), ("1.0.0", "9.9.9")):
+            with self.assertRaises(ValueError):
+                self.desk.apply_config(base_version, target_version, good, good,
+                                       good, {}, self.current)
+        for bad in (None, [], "x", 1, True, {1: "x"}, {"a": float("nan")}):
+            for position in range(3):
+                configs = [good, good, good]
+                configs[position] = bad
+                with self.assertRaises(ValueError):
+                    self.desk.apply_config("1.0.0", "2.0.0", *configs, {}, self.current)
+        for decisions in ([], None, "x", {"/a": "yes"}, {"/b": "target"}):
+            with self.assertRaises(ValueError):
+                self.apply(good, {"a": 2}, good, decisions)
+        # An invalid store fails; a missing store reports unknown releases and
+        # is never created.
+        self.path.write_bytes(b'{"1.0.0": [], "1.0.0": []}')
+        with self.assertRaises(ValueError):
+            self.apply(good, good, good, {})
+        missing_store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        desk = ReleaseDesk(missing_store)
+        with self.assertRaises(ValueError):
+            desk.apply_config("1.0.0", "2.0.0", good, good, good, {}, self.current)
+        self.assertFalse(missing_store.exists())
+        self.assertFalse(missing_store.parent.exists())
+
+    def test_current_file_encoding_json_and_duplicate_keys(self):
+        for raw in (b"\xff\xfe", b"{not json", b'{"a": 1, "a": 2}',
+                    b"[1, 2]", b'"x"', b""):
+            self.current.write_bytes(raw)
+            before = self.current.read_bytes()
+            with self.assertRaises(ValueError, msg=raw):
+                self.apply({"a": 1}, {"a": 2}, {"a": 1}, {})
+            self.assertEqual(self.current.read_bytes(), before)
+
+    def test_same_version_and_reverse_order_allowed(self):
+        self.write_current({"a": 3})
+        same = self.apply({"a": 1}, {"a": 2}, {"a": 3}, {"/a": "target"},
+                          "1.0.0", "1.0.0")
+        self.assertEqual(same["config"], {"a": 2})
+        self.write_current({"a": 3})
+        reverse = self.apply({"a": 2}, {"a": 1}, {"a": 3}, {"/a": "current"},
+                             "2.0.0", "1.0.0")
+        self.assertEqual(reverse["config"], {"a": 3})
+        self.assertFalse(reverse["changed"])
+
+    def test_readonly_inputs_store_untouched_and_result_detached(self):
+        self.write_current({"port": 9000, "gone": {"a": [3]}})
+        store_before, store_mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        base = {"port": 80, "gone": {"a": [1]}}
+        target = {"port": 8080, "gone": {"a": [2]}}
+        expected = {"port": 9000, "gone": {"a": [3]}}
+        decisions = {"/port": "target", "/gone/a": "current"}
+        snapshots = [json.loads(json.dumps(payload)) for payload in (base, target, expected)]
+        result = self.apply(base, target, expected, decisions)
+        self.assertTrue(result["changed"])
+        self.assertEqual(base, snapshots[0])
+        self.assertEqual(target, snapshots[1])
+        self.assertEqual(expected, snapshots[2])
+        self.assertEqual(decisions, {"/port": "target", "/gone/a": "current"})
+        self.assertEqual(self.path.read_bytes(), store_before)
+        self.assertEqual(self.path.stat().st_mtime_ns, store_mtime)
+        # Mutating the result never reaches the input objects.
+        result["config"]["gone"]["a"].append(4)
+        self.assertEqual(expected["gone"]["a"], [3])
+
+    def test_cli_apply_config(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        files = {name: Path(self.temp.name) / f"{name}.json"
+                 for name in ("base", "target", "expected", "decisions")}
+        files["base"].write_text(json.dumps({"port": 80, "timeout": 30}), encoding="utf-8")
+        files["target"].write_text(json.dumps({"port": 8080, "timeout": 30}), encoding="utf-8")
+        files["expected"].write_text(json.dumps({"port": 9000, "timeout": 60}), encoding="utf-8")
+        files["decisions"].write_text(json.dumps({"/port": "target"}), encoding="utf-8")
+        self.write_current({"port": 9000, "timeout": 60})
+        command = prefix + ["apply-config", "1.0.0", "2.0.0",
+                            str(files["base"]), str(files["target"]), str(files["expected"]),
+                            str(files["decisions"]), str(self.current)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "baseVersion": "1.0.0", "targetVersion": "2.0.0", "changed": True,
+            "config": {"port": 8080, "timeout": 60},
+            "resolved": [{"path": "/port", "choice": "target"}]})
+        self.assertEqual(json.loads(self.current.read_text(encoding="utf-8")),
+                         {"port": 8080, "timeout": 60})
+        # Applying again with the new snapshot changes nothing and keeps bytes.
+        files["expected"].write_text(json.dumps({"port": 8080, "timeout": 60}),
+                                     encoding="utf-8")
+        files["decisions"].write_text("{}", encoding="utf-8")
+        before, mtime = self.current.read_bytes(), self.current.stat().st_mtime_ns
+        again = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertFalse(json.loads(again.stdout)["changed"])
+        self.assertEqual(self.current.read_bytes(), before)
+        self.assertEqual(self.current.stat().st_mtime_ns, mtime)
+
+    def test_cli_apply_config_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        store_before = self.path.read_bytes()
+        files = {name: Path(self.temp.name) / f"{name}.json"
+                 for name in ("base", "target", "expected", "decisions")}
+        files["base"].write_text(json.dumps({"port": 80}), encoding="utf-8")
+        files["target"].write_text(json.dumps({"port": 8080}), encoding="utf-8")
+        files["expected"].write_text(json.dumps({"port": 9000}), encoding="utf-8")
+        files["decisions"].write_text(json.dumps({"/port": "target"}), encoding="utf-8")
+        self.write_current({"port": 9000})
+        current_before = self.current.read_bytes()
+
+        def run(*overrides):
+            paths = [files["base"], files["target"], files["expected"],
+                     files["decisions"], self.current]
+            arguments = ["apply-config", "1.0.0", "2.0.0"] + [str(p) for p in paths]
+            for index, value in overrides:
+                arguments[index] = value
+            failed = subprocess.run(prefix + arguments, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, arguments)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+            return failed
+
+        # Bad content in any of the four read-only files or the current file.
+        originals = {name: files[name].read_bytes() for name in files}
+        for name, raw in (("base", "{not json"), ("target", None),
+                          ("expected", '{"x": 1, "x": 2}'), ("decisions", '[1]')):
+            if raw is None:
+                files[name].write_bytes(b"\xff\xfe")
+            else:
+                files[name].write_text(raw, encoding="utf-8")
+            run()
+            files[name].write_bytes(originals[name])
+        self.current.write_bytes(b"\xff\xfe")
+        run()
+        self.current.write_bytes(current_before)
+        # A missing input file, a missing target and bad versions fail.
+        run((6, str(Path(self.temp.name) / "nope.json")))
+        missing_current = Path(self.temp.name) / "missing" / "current.json"
+        run((7, str(missing_current)))
+        self.assertFalse(missing_current.exists())
+        self.assertFalse(missing_current.parent.exists())
+        run((2, "v1"))
+        run((3, "9.9.9"))
+        # The target must not be the store or any of the input files.
+        run((7, str(self.path)))
+        run((7, str(files["base"])))
+        link = Path(self.temp.name) / "link.json"
+        os.symlink(self.current, link)
+        run((7, str(link)))
+        # An expected mismatch and undecided conflicts fail without writing.
+        files["expected"].write_text(json.dumps({"port": 80}), encoding="utf-8")
+        run()
+        files["expected"].write_bytes(originals["expected"])
+        files["decisions"].write_text("{}", encoding="utf-8")
+        run()
+        files["decisions"].write_bytes(originals["decisions"])
+        # Nothing was written anywhere.
+        self.assertEqual(self.current.read_bytes(), current_before)
+        self.assertEqual(self.path.read_bytes(), store_before)
+        # A missing store is treated as empty, reports unknown versions, and is not created.
+        store = Path(self.temp.name) / "missing-dir" / "releases.json"
+        failed = subprocess.run(
+            [sys.executable, str(ROOT / "release_desk.py"), "--store", str(store),
+             "apply-config", "1.0.0", "2.0.0", str(files["base"]), str(files["target"]),
+             str(files["expected"]), str(files["decisions"]), str(self.current)],
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(json.loads(failed.stdout), {"error": "unknown release"})
+        self.assertFalse(store.exists())
+        self.assertFalse(store.parent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

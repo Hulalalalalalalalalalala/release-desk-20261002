@@ -840,6 +840,57 @@ class ReleaseDesk:
                 "canApply": not remaining, "config": config,
                 "conflicts": remaining, "resolved": resolved}
 
+    def apply_config(self, base_version, target_version, base_config, target_config,
+                     expected_config, decisions, current_path):
+        # The only writing config operation: applies the confirmed
+        # base->target plan to an existing current configuration file. The
+        # file must match the expected snapshot under the diff_config equality
+        # rules and every conflict must be decided; only then is the file
+        # replaced wholesale, and only when the resolved configuration is
+        # semantically different from what was read.
+        for version in (base_version, target_version):
+            if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+                raise ValueError("version must have three nonnegative numeric components")
+        _validated_config(base_config)
+        _validated_config(target_config)
+        _validated_config(expected_config)
+        _validated_decisions(decisions)
+        # The whole store is validated before either version is looked up.
+        records = self._read_store()
+        if base_version not in records:
+            raise ValueError("unknown release")
+        if target_version not in records:
+            raise ValueError("unknown release")
+        # The target must already exist as a non-symlink file and must not be
+        # the store itself, however spelled or linked; a missing target is
+        # never created, nor is its directory.
+        target = Path(current_path)
+        if not target.exists():
+            raise ValueError("current configuration file must already exist")
+        if target.is_symlink():
+            raise ValueError("current configuration file must not be a symbolic link")
+        if _same_file(target, self.path):
+            raise ValueError("current configuration must not be the same file as the store")
+        # OSErrors (permissions, directory target, ...) propagate unchanged.
+        try:
+            current_config = _loads_unique(target.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("current configuration file must contain UTF-8 encoded JSON") from exc
+        _validated_config(current_config)
+        if not _json_values_equal(current_config, expected_config):
+            raise ValueError("current configuration does not match the expected configuration")
+        confirmed = self.resolve_config(base_version, target_version, base_config,
+                                        target_config, current_config, decisions)
+        if not confirmed["canApply"]:
+            raise ValueError("unresolved conflicts remain")
+        config = confirmed["config"]
+        changed = not _json_values_equal(config, current_config)
+        if changed:
+            content = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+            _atomic_write(target, content)
+        return {"baseVersion": base_version, "targetVersion": target_version,
+                "changed": changed, "config": config, "resolved": confirmed["resolved"]}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -877,6 +928,14 @@ def main():
     resolve_config.add_argument("target_config")
     resolve_config.add_argument("current_config")
     resolve_config.add_argument("decisions")
+    apply_config = commands.add_parser("apply-config")
+    apply_config.add_argument("base_version")
+    apply_config.add_argument("target_version")
+    apply_config.add_argument("base_config")
+    apply_config.add_argument("target_config")
+    apply_config.add_argument("expected_config")
+    apply_config.add_argument("decisions")
+    apply_config.add_argument("current_config")
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
@@ -958,6 +1017,34 @@ def main():
                 result = desk.resolve_config(args.base_version, args.target_version,
                                              base_payload, target_payload, current_payload,
                                              decisions_payload)
+            elif args.command == "apply-config":
+                try:
+                    base_payload = _loads_unique(Path(args.base_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("base configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    target_payload = _loads_unique(Path(args.target_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("target configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    expected_payload = _loads_unique(Path(args.expected_config).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("expected configuration file must contain UTF-8 encoded JSON") from exc
+                try:
+                    decisions_payload = _loads_unique(Path(args.decisions).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("decisions file must contain UTF-8 encoded JSON") from exc
+                # The write target must not be any of the read-only inputs,
+                # however spelled or linked; the store check happens inside
+                # apply_config.
+                current_path = Path(args.current_config)
+                for input_file in (args.base_config, args.target_config,
+                                   args.expected_config, args.decisions):
+                    if _same_file(current_path, Path(input_file)):
+                        raise ValueError("current configuration must not be the same file as an input file")
+                result = desk.apply_config(args.base_version, args.target_version,
+                                           base_payload, target_payload, expected_payload,
+                                           decisions_payload, current_path)
             elif args.command == "check":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
