@@ -5482,6 +5482,241 @@ class UpdateChecklistTests(unittest.TestCase):
         self.assertEqual(self.checklist.read_bytes(), before)
 
 
+class UpdateChecklistDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+        self.checklist = Path(self.temp.name) / "checklist.json"
+
+    def write_checklist(self, items, version="1.2.0"):
+        self.checklist.write_text(
+            json.dumps({"version": version, "items": items}), encoding="utf-8")
+
+    def graph(self, mapping):
+        self.dependencies = Path(self.temp.name) / "dependencies.json"
+        self.dependencies.write_text(json.dumps(mapping), encoding="utf-8")
+        return mapping
+
+    def standard_items(self):
+        return [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "pending"},
+        ]
+
+    def test_same_batch_completion_passes_regardless_of_order(self):
+        self.write_checklist(self.standard_items())
+        dependencies = self.graph({"sign": ["docs"], "nice": ["sign"]})
+        for order in (
+            [{"id": "nice", "expected": "pending", "status": "done"},
+             {"id": "sign", "expected": "pending", "status": "done"}],
+            [{"id": "sign", "expected": "pending", "status": "done"},
+             {"id": "nice", "expected": "pending", "status": "done"}],
+        ):
+            self.write_checklist(self.standard_items())
+            result = self.desk.update_checklist("1.2.0", order, self.checklist, dependencies)
+            self.assertEqual(result["updated"], ["sign", "nice"])
+            self.assertEqual(set(result), {"version", "changed", "items", "updated", "ready"})
+
+    def test_direct_prerequisite_not_done_rejects_without_write(self):
+        # sign required is declared done while its optional prerequisite nice
+        # stays pending; a no-change update targeting sign at done must still
+        # fail, and the target bytes survive.
+        items = [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "done"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "pending"},
+        ]
+        self.write_checklist(items)
+        before = self.checklist.read_bytes()
+        dependencies = self.graph({"sign": ["nice"]})
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [
+                {"id": "sign", "expected": "done", "status": "done"}],
+                self.checklist, dependencies)
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_transitively_blocked_prerequisite_lists_only_direct_one(self):
+        items = [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "blocked"},
+        ]
+        self.write_checklist(items)
+        # sign -> nice -> docs, with docs pending: nice stays effectively
+        # blocked and sign's reported wait lists only nice.
+        dependencies = self.graph({"sign": ["nice"], "nice": ["docs"]})
+        before = self.checklist.read_bytes()
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [
+                {"id": "sign", "expected": "pending", "status": "done"}],
+                self.checklist, dependencies)
+        self.assertEqual(self.checklist.read_bytes(), before)
+        # Completing both in one batch in the "wrong" order is still accepted.
+        result = self.desk.update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "blocked", "status": "done"},
+            {"id": "docs", "expected": "pending", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertEqual(result["updated"], ["docs", "sign", "nice"])
+
+    def test_untouched_items_never_trigger_rejection(self):
+        # sign declared done with a pending prerequisite is not part of the
+        # batch; an unrelated valid update still writes, and ready keeps the
+        # declared-status rule.
+        items = [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "done"},
+            {"id": "nice", "text": "Polish page", "required": False, "status": "pending"},
+        ]
+        self.write_checklist(items)
+        dependencies = self.graph({"sign": ["nice"]})
+        result = self.desk.update_checklist("1.2.0", [
+            {"id": "docs", "expected": "done", "status": "pending"}],
+            self.checklist, dependencies)
+        self.assertEqual(result["updated"], ["docs"])
+        self.assertFalse(result["ready"])
+
+    def test_target_other_than_done_skips_the_dependency_gate(self):
+        items = [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "done"},
+        ]
+        self.write_checklist(items)
+        dependencies = self.graph({"sign": ["docs"]})
+        # Moving sign away from done is allowed although docs is unfinished.
+        result = self.desk.update_checklist("1.2.0", [
+            {"id": "sign", "expected": "done", "status": "blocked"}],
+            self.checklist, dependencies)
+        self.assertEqual(result["items"][1]["status"], "blocked")
+
+    def test_prerequisite_taken_away_from_done_in_same_batch_fails(self):
+        items = [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "sign", "text": "Sign build", "required": True, "status": "pending"},
+        ]
+        self.write_checklist(items)
+        before = self.checklist.read_bytes()
+        dependencies = self.graph({"sign": ["docs"]})
+        with self.assertRaises(ValueError):
+            self.desk.update_checklist("1.2.0", [
+                {"id": "sign", "expected": "pending", "status": "done"},
+                {"id": "docs", "expected": "done", "status": "pending"}],
+                self.checklist, dependencies)
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_empty_object_enables_mode_and_empty_batch_validates_whole_graph(self):
+        self.write_checklist(self.standard_items())
+        result = self.desk.update_checklist(
+            "1.2.0", [], self.checklist, {})
+        self.assertFalse(result["changed"])
+        for bad in (
+            {"unknown": []},
+            {"sign": ["missing"]},
+            {"sign": ["sign"]},
+            {"docs": ["sign"], "sign": ["docs"]},
+            [], "x",
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.desk.update_checklist("1.2.0", [], self.checklist, bad)
+
+    def test_dependency_inputs_untouched_and_result_detached(self):
+        self.write_checklist(self.standard_items())
+        dependencies = {"sign": ["docs"]}
+        snapshot = json.loads(json.dumps(dependencies))
+        result = self.desk.update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertEqual(dependencies, snapshot)
+        result["items"][1]["status"] = "blocked"
+        self.assertEqual(dependencies["sign"], ["docs"])
+        again = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "done", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertEqual(again["items"][1]["status"], "done")
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "update-checklist", *extra]
+
+    def test_cli_dependencies_write_and_dry_run(self):
+        self.write_checklist(self.standard_items())
+        updates_file = Path(self.temp.name) / "updates.json"
+        updates_file.write_text(json.dumps([
+            {"id": "sign", "expected": "pending", "status": "done"}]), encoding="utf-8")
+        dependencies = self.graph({"sign": ["docs"]})
+        # Without the flag a pending prerequisite in the file is irrelevant.
+        result = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dependencies", str(self.dependencies)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(set(json.loads(result.stdout)),
+                         {"version", "changed", "items", "updated", "ready"})
+        # Dry run over an unsatisfied prerequisite exits 0 with a plan failure.
+        self.write_checklist(self.standard_items())
+        self.graph({"sign": ["nice"]})
+        dry = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dry-run", "--dependencies", str(self.dependencies)),
+            capture_output=True, text=True)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        report = json.loads(dry.stdout)
+        self.assertFalse(report["canUpdate"])
+        self.assertEqual(report["dependencyConflicts"],
+                         [{"id": "sign", "waiting": ["nice"]}])
+        # The same plan without --dry-run exits 2 and preserves the bytes.
+        before = self.checklist.read_bytes()
+        failed = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dependencies", str(self.dependencies)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stdout))
+        self.assertEqual(self.checklist.read_bytes(), before)
+
+    def test_cli_dependencies_file_rules(self):
+        self.write_checklist(self.standard_items())
+        updates_file = Path(self.temp.name) / "updates.json"
+        updates_file.write_text("[]", encoding="utf-8")
+        # The dependency file must not alias the target checklist.
+        same = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dependencies", str(self.checklist)),
+            capture_output=True, text=True)
+        self.assertEqual(same.returncode, 2)
+        self.assertIn("error", json.loads(same.stdout))
+        alias_path = Path(self.temp.name) / "alias.json"
+        alias_path.write_text("{}", encoding="utf-8")
+        hard = Path(self.temp.name) / "hard.json"
+        os.link(alias_path, hard)
+        for dep_path in (str(alias_path), str(hard)):
+            failed = subprocess.run(
+                self.command("1.2.0", str(updates_file), str(alias_path),
+                             "--dependencies", dep_path),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, dep_path)
+        # Bad bytes, syntax, duplicate keys and a missing file fail with exit 2.
+        bad_dep = Path(self.temp.name) / "bad.json"
+        for raw in (b"{not json", b"\xff\xfe", b'{"a": [], "a": []}'):
+            bad_dep.write_bytes(raw)
+            failed = subprocess.run(
+                self.command("1.2.0", str(updates_file), str(self.checklist),
+                             "--dependencies", str(bad_dep)),
+                capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, raw)
+        failed = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dependencies", str(Path(self.temp.name) / "nope.json")),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+
+
 class PreviewUpdateChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
@@ -5793,6 +6028,242 @@ class PreviewUpdateChecklistTests(unittest.TestCase):
             self.assertEqual(failed.returncode, 2, arguments)
             self.assertIn("error", json.loads(failed.stdout))
         self.assertEqual(self.checklist.read_bytes(), before)
+
+
+class PreviewUpdateChecklistDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"},
+                                {"category": "Fixed", "text": "Two"}])
+        self.checklist = Path(self.temp.name) / "checklist.json"
+
+    def write_checklist(self, items, version="1.2.0"):
+        self.checklist.write_text(
+            json.dumps({"version": version, "items": items}), encoding="utf-8")
+
+    def items(self, statuses):
+        texts = {"docs": "Write notes", "sign": "Sign build", "nice": "Polish page",
+                 "final": "Final check"}
+        required = {"docs": True, "sign": True, "nice": False, "final": True}
+        return [{"id": item_id, "text": texts[item_id],
+                 "required": required[item_id], "status": status}
+                for item_id, status in statuses.items()]
+
+    BASE = {"docs": "done", "sign": "pending", "nice": "pending", "final": "pending"}
+
+    def test_success_shape_candidate_dependency_check(self):
+        self.write_checklist(self.items(self.BASE))
+        dependencies = {"sign": ["docs"], "final": ["sign", "nice"]}
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "pending", "status": "done"},
+            {"id": "final", "expected": "pending", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertEqual(set(result),
+                         {"version", "canUpdate", "changed", "items", "updated",
+                          "ready", "conflicts", "dependencyConflicts",
+                          "dependencyCheck"})
+        self.assertTrue(result["canUpdate"])
+        self.assertEqual(result["updated"], ["sign", "nice", "final"])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["dependencyConflicts"], [])
+        # dependencyCheck is the complete check_dependencies report over the
+        # whole candidate, and top-level ready matches it.
+        expected_check = self.desk.check_dependencies(
+            "1.2.0", {"version": "1.2.0", "items": result["items"]}, dependencies)
+        self.assertEqual(result["dependencyCheck"], expected_check)
+        self.assertTrue(result["dependencyCheck"]["ready"])
+        self.assertEqual(result["ready"], result["dependencyCheck"]["ready"])
+        for report_item in result["dependencyCheck"]["items"]:
+            self.assertEqual(set(report_item),
+                             {"id", "text", "required", "status",
+                              "effectiveStatus", "waiting"})
+
+    def test_batch_order_does_not_change_the_result(self):
+        dependencies = {"final": ["sign"], "sign": ["docs"]}
+        orders = [
+            [{"id": "final", "expected": "pending", "status": "done"},
+             {"id": "sign", "expected": "pending", "status": "done"}],
+            [{"id": "sign", "expected": "pending", "status": "done"},
+             {"id": "final", "expected": "pending", "status": "done"}],
+        ]
+        plans = []
+        for order in orders:
+            self.write_checklist(self.items(self.BASE))
+            plans.append(self.desk.preview_update_checklist(
+                "1.2.0", order, self.checklist, dependencies))
+        self.assertTrue(all(plan["canUpdate"] for plan in plans))
+        self.assertEqual(plans[0]["dependencyConflicts"], plans[1]["dependencyConflicts"])
+        self.assertEqual(plans[0]["items"], plans[1]["items"])
+
+    def test_dependency_conflicts_shape_order_and_waiting(self):
+        statuses = {"docs": "done", "sign": "pending", "nice": "blocked",
+                    "final": "pending"}
+        self.write_checklist(self.items(statuses))
+        # final waits on sign (effectively blocked via nice) and nice itself;
+        # only direct prerequisites appear, in dependency-array order.
+        dependencies = {"sign": ["nice"], "final": ["sign", "nice"], "nice": ["docs"]}
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "docs", "expected": "done", "status": "done"},
+            {"id": "final", "expected": "pending", "status": "done"},
+            {"id": "sign", "expected": "pending", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertFalse(result["canUpdate"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated"], [])
+        self.assertEqual(result["conflicts"], [])
+        # Conflicts follow the updates-array order: final before sign.
+        self.assertEqual(result["dependencyConflicts"], [
+            {"id": "final", "waiting": ["sign", "nice"]},
+            {"id": "sign", "waiting": ["nice"]}])
+        for conflict in result["dependencyConflicts"]:
+            self.assertEqual(set(conflict), {"id", "waiting"})
+        # items are the normalized original checklist, untouched.
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["done", "pending", "blocked", "pending"])
+        # dependencyCheck is computed over those original items.
+        expected_check = self.desk.check_dependencies(
+            "1.2.0", {"version": "1.2.0", "items": result["items"]}, dependencies)
+        self.assertEqual(result["dependencyCheck"], expected_check)
+        self.assertFalse(result["ready"])
+
+    def test_already_done_target_is_still_gated(self):
+        statuses = {"docs": "done", "sign": "done", "nice": "pending",
+                    "final": "pending"}
+        self.write_checklist(self.items(statuses))
+        dependencies = {"sign": ["nice"]}
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "done", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertFalse(result["canUpdate"])
+        self.assertEqual(result["dependencyConflicts"],
+                         [{"id": "sign", "waiting": ["nice"]}])
+        self.assertFalse(result["changed"])
+
+    def test_untouched_blocked_items_do_not_appear_as_conflicts(self):
+        statuses = {"docs": "done", "sign": "done", "nice": "pending",
+                    "final": "pending"}
+        self.write_checklist(self.items(statuses))
+        dependencies = {"sign": ["nice"], "final": ["sign"]}
+        # Only docs is targeted; sign/final stay invalid but are not checked.
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "docs", "expected": "done", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertTrue(result["canUpdate"])
+        self.assertEqual(result["dependencyConflicts"], [])
+        # The complete check still shows the untouched invalid state.
+        by_id = {item["id"]: item for item in result["dependencyCheck"]["items"]}
+        self.assertEqual(by_id["sign"]["effectiveStatus"], "blocked")
+        self.assertEqual(by_id["sign"]["waiting"], ["nice"])
+        self.assertEqual(by_id["final"]["waiting"], ["sign"])
+
+    def test_original_conflicts_leave_dependency_conflicts_empty(self):
+        self.write_checklist(self.items(self.BASE))
+        dependencies = {"sign": ["nice"]}
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "nope", "expected": "pending", "status": "done"},
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "docs", "expected": "blocked", "status": "done"}],
+            self.checklist, dependencies)
+        self.assertFalse(result["canUpdate"])
+        self.assertEqual([c["reason"] for c in result["conflicts"]],
+                         ["unknown-id", "status-mismatch"])
+        self.assertEqual(result["dependencyConflicts"], [])
+        # The dependency check still covers the normalized original checklist.
+        expected_check = self.desk.check_dependencies(
+            "1.2.0", {"version": "1.2.0", "items": result["items"]}, dependencies)
+        self.assertEqual(result["dependencyCheck"], expected_check)
+
+    def test_empty_object_and_empty_batch_validate_whole_graph(self):
+        self.write_checklist(self.items(self.BASE))
+        result = self.desk.preview_update_checklist(
+            "1.2.0", [], self.checklist, {})
+        self.assertTrue(result["canUpdate"])
+        self.assertIn("dependencyConflicts", result)
+        self.assertEqual(result["dependencyConflicts"], [])
+        expected_check = self.desk.check_dependencies(
+            "1.2.0", {"version": "1.2.0", "items": result["items"]}, {})
+        self.assertEqual(result["dependencyCheck"], expected_check)
+        for bad in (
+            {"unknown": []}, {"sign": ["missing"]}, {"sign": ["sign"]},
+            {"docs": ["sign"], "sign": ["docs"]}, [], "x",
+            {"sign": "x"}, {"sign": [1]}, {" sign ": ["sign"], "sign": []},
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.desk.preview_update_checklist(
+                    "1.2.0", [], self.checklist, bad)
+
+    def test_omitting_dependencies_keeps_original_shape(self):
+        self.write_checklist(self.items(self.BASE))
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"}], self.checklist)
+        self.assertEqual(set(result),
+                         {"version", "canUpdate", "changed", "items", "updated",
+                          "ready", "conflicts"})
+
+    def test_preview_never_writes_and_inputs_untouched(self):
+        self.write_checklist(self.items(self.BASE))
+        before = self.checklist.read_bytes()
+        mtime = self.checklist.stat().st_mtime_ns
+        dependencies = {"sign": ["nice"]}
+        snapshot = json.loads(json.dumps(dependencies))
+        result = self.desk.preview_update_checklist("1.2.0", [
+            {"id": "sign", "expected": "pending", "status": "done"}],
+            self.checklist, dependencies)
+        result["dependencyConflicts"].append({"id": "x"})
+        result["dependencyCheck"]["items"][0]["status"] = "blocked"
+        self.assertEqual(dependencies, snapshot)
+        self.assertEqual(self.checklist.read_bytes(), before)
+        self.assertEqual(self.checklist.stat().st_mtime_ns, mtime)
+
+    def command(self, *extra):
+        return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
+                "update-checklist", *extra]
+
+    def test_cli_dry_run_dependency_success_and_conflict(self):
+        self.write_checklist(self.items(self.BASE))
+        updates_file = Path(self.temp.name) / "updates.json"
+        dep_file = Path(self.temp.name) / "dependencies.json"
+        updates_file.write_text(json.dumps([
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "nice", "expected": "pending", "status": "done"},
+            {"id": "final", "expected": "pending", "status": "done"}]), encoding="utf-8")
+        dep_file.write_text(json.dumps(
+            {"sign": ["docs"], "final": ["sign", "nice"]}), encoding="utf-8")
+        ok = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dry-run", "--dependencies", str(dep_file)),
+            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(ok.stdout.count("\n"), 1)
+        report = json.loads(ok.stdout)
+        self.assertTrue(report["canUpdate"])
+        self.assertEqual(report["dependencyConflicts"], [])
+        self.assertIn("dependencyCheck", report)
+        self.assertEqual(self.checklist.read_bytes(),
+                         json.dumps({"version": "1.2.0",
+                                     "items": self.items(self.BASE)}).encode("utf-8"))
+        # Drop the same-batch completion of nice: sign is completed in the
+        # same batch and passes, so only the untouched nice is waited on.
+        updates_file.write_text(json.dumps([
+            {"id": "sign", "expected": "pending", "status": "done"},
+            {"id": "final", "expected": "pending", "status": "done"}]), encoding="utf-8")
+        dep_file.write_text(json.dumps({"final": ["nice", "sign"], "sign": ["docs"]}),
+                            encoding="utf-8")
+        blocked = subprocess.run(
+            self.command("1.2.0", str(updates_file), str(self.checklist),
+                         "--dependencies", str(dep_file), "--dry-run"),
+            capture_output=True, text=True)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        report = json.loads(blocked.stdout)
+        self.assertFalse(report["canUpdate"])
+        self.assertEqual(report["dependencyConflicts"], [
+            {"id": "final", "waiting": ["nice"]}])
+        self.assertFalse(report["changed"])
+        self.assertEqual(report["updated"], [])
 
 
 class ReleaseRecordTests(unittest.TestCase):
