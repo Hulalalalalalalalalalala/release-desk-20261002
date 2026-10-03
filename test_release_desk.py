@@ -1185,6 +1185,249 @@ class CheckDependenciesTests(unittest.TestCase):
                          {"releases.json", "checklist.json", "dependencies.json"})
 
 
+class ExplainDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"}])
+
+    def payload(self, *items):
+        return {"version": "1.2.0", "items": list(items)}
+
+    def test_spec_example_chain_reports_only_leaf_reason(self):
+        # A (required, done) depends on B (optional, done), B on pending C:
+        # only C is a reason, with A affected through the path A, B, C.
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+        )
+        report = self.desk.explain_dependencies("1.2.0", payload, {"a": ["b"], "b": ["c"]})
+        self.assertEqual(set(report), {"version", "ready", "reasons"})
+        self.assertEqual(report["version"], "1.2.0")
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["reasons"], [
+            {"id": "c", "text": "C", "required": False, "status": "pending",
+             "affected": [{"id": "a", "path": ["a", "b", "c"]}]}])
+
+    def test_ready_report_has_empty_reasons(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+        )
+        for dependencies in ({}, {"a": []}, {"b": []}):
+            report = self.desk.explain_dependencies("1.2.0", payload, dependencies)
+            self.assertTrue(report["ready"])
+            self.assertEqual(report["reasons"], [])
+
+    def test_unfinished_required_item_is_its_own_reason(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "blocked"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+        )
+        report = self.desk.explain_dependencies("1.2.0", payload, {})
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["reasons"], [
+            {"id": "a", "text": "A", "required": True, "status": "blocked",
+             "affected": [{"id": "a", "path": ["a"]}]}])
+
+    def test_tracing_continues_past_pending_and_blocked_nodes(self):
+        # A declared-pending node still traces its own prerequisites, so both
+        # the pending middle item and the blocked leaf are reasons.
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "blocked"},
+        )
+        report = self.desk.explain_dependencies("1.2.0", payload, {"a": ["b"], "b": ["c"]})
+        self.assertEqual([reason["id"] for reason in report["reasons"]], ["b", "c"])
+        self.assertEqual(report["reasons"][0]["affected"],
+                         [{"id": "a", "path": ["a", "b"]}])
+        self.assertEqual(report["reasons"][1]["affected"],
+                         [{"id": "a", "path": ["a", "b", "c"]}])
+
+    def test_optional_items_not_affecting_required_items_are_omitted(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "blocked"},
+        )
+        report = self.desk.explain_dependencies("1.2.0", payload, {"b": ["c"]})
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["reasons"], [])
+
+    def test_reasons_and_affected_follow_checklist_order(self):
+        payload = self.payload(
+            {"id": "z", "text": "Z", "required": True, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "blocked"},
+        )
+        dependencies = {"z": ["c", "b"], "a": ["b", "c"]}
+        report = self.desk.explain_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual([reason["id"] for reason in report["reasons"]], ["c", "b"])
+        for reason in report["reasons"]:
+            self.assertEqual([entry["id"] for entry in reason["affected"]], ["z", "a"])
+
+    def test_path_prefers_fewest_edges(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+        )
+        # The direct edge wins over the longer route through b.
+        report = self.desk.explain_dependencies(
+            "1.2.0", payload, {"a": ["b", "c"], "b": ["c"]})
+        self.assertEqual(report["reasons"][0]["affected"],
+                         [{"id": "a", "path": ["a", "c"]}])
+
+    def test_equal_length_paths_break_ties_by_checklist_position(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "done"},
+            {"id": "d", "text": "D", "required": False, "status": "pending"},
+        )
+        # b precedes c in the checklist, so the path through b wins no matter
+        # how the dependency arrays are ordered.
+        for dependencies in ({"a": ["c", "b"], "b": ["d"], "c": ["d"]},
+                             {"a": ["b", "c"], "c": ["d"], "b": ["d"]}):
+            report = self.desk.explain_dependencies("1.2.0", payload, dependencies)
+            self.assertEqual(report["reasons"][0]["affected"],
+                             [{"id": "a", "path": ["a", "b", "d"]}])
+
+    def test_existing_version_checklist_dependency_and_store_checks_reused(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"})
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.explain_dependencies(version, payload, {})
+        with self.assertRaises(ValueError):
+            self.desk.explain_dependencies("9.9.9", payload, {})
+        mismatched = {"version": "1.0.0", "items": payload["items"]}
+        with self.assertRaises(ValueError):
+            self.desk.explain_dependencies("1.2.0", mismatched, {})
+        for dependencies in (None, [], {"a": ["a"]}, {"a": ["z"]}, {"z": []},
+                             {"a": [], " a ": []}):
+            with self.assertRaises(ValueError):
+                self.desk.explain_dependencies("1.2.0", payload, dependencies)
+        raw = b'{"1.2.0": [{"category": "Added", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.explain_dependencies("1.2.0", payload, {})
+
+    def test_missing_store_is_empty_and_unknown(self):
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        payload = self.payload({"id": "a", "text": "A", "required": True, "status": "done"})
+        with self.assertRaises(ValueError):
+            desk.explain_dependencies("1.2.0", payload, {})
+
+    def test_readonly_inputs_untouched_and_result_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+        )
+        dependencies = {"a": ["b"]}
+        payload_snapshot = json.loads(json.dumps(payload))
+        report = self.desk.explain_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(payload, payload_snapshot)
+        self.assertEqual(dependencies, {"a": ["b"]})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        report["reasons"][0]["affected"][0]["path"].append("x")
+        report["reasons"][0]["status"] = "done"
+        again = self.desk.explain_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(again["reasons"][0]["affected"][0]["path"], ["a", "b"])
+        self.assertEqual(again["reasons"][0]["status"], "pending")
+
+    def test_cli_explain_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        data = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": " Notes ", "required": True, "status": "done"},
+            {"id": "build", "text": "Build", "required": False, "status": "done"},
+            {"id": "sign", "text": "Sign", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(data), encoding="utf-8")
+        dependencies.write_text(json.dumps({"docs": ["build"], "build": ["sign"]}),
+                                encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["explain-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "version": "1.2.0", "ready": False,
+            "reasons": [
+                {"id": "sign", "text": "Sign", "required": False, "status": "pending",
+                 "affected": [{"id": "docs", "path": ["docs", "build", "sign"]}]}]})
+        # A ready report is still a successful single-line result.
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["explain-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout),
+                         {"version": "1.2.0", "ready": True, "reasons": []})
+
+    def test_cli_explain_dependencies_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        good_checklist = {"version": "1.2.0", "items": [
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        cases = [
+            ("{not json", "{}"),
+            (b"\xff\xfe", "{}"),
+            (json.dumps(good_checklist), "{not json"),
+            (json.dumps(good_checklist), b"\xff\xfe"),
+            ('{"version": "1.2.0", "version": "1.2.0", "items": []}', "{}"),
+            (json.dumps(good_checklist), '{"a": ["a"]}'),
+            (json.dumps(good_checklist), '{"a": ["b"], "b": ["a"]}'),
+            (json.dumps(good_checklist), '{"z": []}'),
+            (json.dumps({"version": "2.0.0", "items": good_checklist["items"]}), "{}"),
+        ]
+        for checklist_case, deps_case in cases:
+            if isinstance(checklist_case, bytes):
+                checklist.write_bytes(checklist_case)
+            else:
+                checklist.write_text(checklist_case, encoding="utf-8")
+            if isinstance(deps_case, bytes):
+                dependencies.write_bytes(deps_case)
+            else:
+                dependencies.write_text(deps_case, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["explain-dependencies", "1.2.0", str(checklist), str(dependencies)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, (checklist_case, deps_case, result.stdout))
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        # Unknown version and missing files fail with one error line.
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["explain-dependencies", "9.9.9", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        missing = directory / "nope.json"
+        for args in (["explain-dependencies", "1.2.0", str(missing), str(dependencies)],
+                     ["explain-dependencies", "1.2.0", str(checklist), str(missing)]):
+            result = subprocess.run(prefix + args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            self.assertFalse(missing.exists())
+        # Nothing was created beyond the two input files and the store.
+        self.assertEqual({path.name for path in directory.iterdir()},
+                         {"releases.json", "checklist.json", "dependencies.json"})
+
+
 class GenerateChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
