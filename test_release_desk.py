@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -3508,6 +3509,272 @@ class MigrateChecklistTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertFalse(store.exists())
         self.assertFalse(store.parent.exists())
+
+
+class MigrateChecklistWithDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [
+            {"category": "Added", "text": "Feature A"},
+            {"category": "Fixed", "text": "Fix one"},
+        ])
+        # Added changed; the Fixed entry is identical.
+        self.desk.add("2.0.0", [
+            {"category": "Added", "text": "Feature A2"},
+            {"category": "Fixed", "text": "Fix one"},
+        ])
+
+    def template(self, **overrides):
+        data = {"items": [
+            {"id": "gate", "text": "Gate build", "required": True},
+            {"id": "added", "text": "Check added", "required": True, "categories": ["Added"]},
+            {"id": "fixed", "text": "Check fixed", "required": False, "categories": ["Fixed"]},
+            {"id": "extra", "text": "Check changed", "required": False, "categories": ["Changed"]},
+        ]}
+        data.update(overrides)
+        return data
+
+    def checklist(self, version="1.0.0", **overrides):
+        data = {"version": version, "items": [
+            {"id": "gate", "text": "Gate build", "required": True, "status": "done"},
+            {"id": "added", "text": "Check added", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Check fixed", "required": False, "status": "done"},
+            {"id": "legacy", "text": "Legacy", "required": False, "status": "done"},
+        ]}
+        data.update(overrides)
+        return data
+
+    def migrate(self, base="1.0.0", target="1.0.0", checklist=None, template=None,
+                base_dependencies=None, dependencies=None):
+        return self.desk.migrate_checklist_with_dependencies(
+            base, target,
+            checklist if checklist is not None else self.checklist(),
+            template if template is not None else self.template(),
+            base_dependencies if base_dependencies is not None else {"added": ["fixed"]},
+            dependencies if dependencies is not None
+            else {"added": ["fixed"], "fixed": ["extra"]})
+
+    def test_report_shape_closure_and_propagation(self):
+        result = self.migrate()
+        self.assertEqual(set(result), {
+            "baseVersion", "version", "items", "retained", "reset", "added",
+            "removed", "dependencies", "includedPrerequisites"})
+        self.assertEqual(result["baseVersion"], "1.0.0")
+        self.assertEqual(result["version"], "1.0.0")
+        # extra enters only through the dependency edge fixed -> extra.
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["gate", "added", "fixed", "extra"])
+        self.assertEqual(result["items"], [
+            {"id": "gate", "text": "Gate build", "required": True, "status": "done"},
+            {"id": "added", "text": "Check added", "required": True, "status": "pending"},
+            {"id": "fixed", "text": "Check fixed", "required": False, "status": "pending"},
+            {"id": "extra", "text": "Check changed", "required": False, "status": "pending"},
+        ])
+        # fixed resets on the changed prerequisite set; added reaches fixed
+        # along the new graph and resets too, while gate stays retained.
+        self.assertEqual(result["retained"], ["gate"])
+        self.assertEqual(result["reset"], ["added", "fixed"])
+        self.assertEqual(result["added"], ["extra"])
+        self.assertEqual(result["removed"], ["legacy"])
+        self.assertEqual(result["dependencies"], {
+            "gate": [], "added": ["fixed"], "fixed": ["extra"], "extra": []})
+        self.assertEqual(result["includedPrerequisites"], ["extra"])
+
+    def test_cross_version_evidence_reset(self):
+        result = self.migrate(target="2.0.0")
+        # Added changed between the releases: the uncategorized gate and the
+        # Added-scoped item reset on evidence, fixed resets on its new
+        # prerequisite set, and nothing is retained.
+        self.assertEqual(result["retained"], [])
+        self.assertEqual(result["reset"], ["gate", "added", "fixed"])
+        self.assertEqual(result["added"], ["extra"])
+        self.assertEqual(result["removed"], ["legacy"])
+
+    def test_cross_version_scoped_item_retained(self):
+        result = self.migrate(target="2.0.0",
+                              base_dependencies={"added": ["fixed"]},
+                              dependencies={"added": ["fixed"]})
+        # Only Added changed, so the Fixed-scoped item keeps its status; the
+        # unreached template item extra stays out of the result entirely.
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["gate", "added", "fixed"])
+        self.assertEqual(result["retained"], ["fixed"])
+        self.assertEqual(result["reset"], ["gate", "added"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], ["legacy"])
+        self.assertEqual(result["dependencies"],
+                         {"gate": [], "added": ["fixed"], "fixed": []})
+        self.assertEqual(result["includedPrerequisites"], [])
+
+    def test_pending_prerequisite_does_not_reset(self):
+        checklist = self.checklist()
+        checklist["items"][2]["status"] = "pending"
+        result = self.migrate(checklist=checklist,
+                              base_dependencies={"added": ["fixed"]},
+                              dependencies={"added": ["fixed"]})
+        # A merely pending prerequisite never resets its dependent.
+        self.assertEqual(result["retained"], ["gate", "added", "fixed"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual(result["added"], [])
+        statuses = {item["id"]: item["status"] for item in result["items"]}
+        self.assertEqual(statuses, {"gate": "done", "added": "done", "fixed": "pending"})
+
+    def test_redefinition_resets_and_propagates(self):
+        template = self.template()
+        template["items"][2]["text"] = "Check the fix thoroughly"
+        result = self.migrate(template=template,
+                              base_dependencies={"added": ["fixed"]},
+                              dependencies={"added": ["fixed"]})
+        # fixed is redefined; added reaches it along the new graph and resets.
+        self.assertEqual(result["retained"], ["gate"])
+        self.assertEqual(result["reset"], ["added", "fixed"])
+        self.assertEqual(result["added"], [])
+
+    def test_validation_errors(self):
+        for base, target in (("v1", "1.0.0"), ("1.0.0", "2.0"),
+                             ("9.9.9", "1.0.0"), ("1.0.0", "9.9.9")):
+            with self.assertRaises(ValueError, msg=(base, target)):
+                self.migrate(base=base, target=target)
+        # The checklist must declare the base version.
+        with self.assertRaises(ValueError):
+            self.migrate(target="2.0.0", checklist=self.checklist(version="2.0.0"))
+        # The old graph is checked against the whole old checklist.
+        with self.assertRaises(ValueError):
+            self.migrate(base_dependencies={"added": ["nope"]})
+        with self.assertRaises(ValueError):
+            self.migrate(base_dependencies={"added": ["extra"]})
+        # The new graph is checked against the whole new template.
+        with self.assertRaises(ValueError):
+            self.migrate(dependencies={"added": ["legacy"]})
+        with self.assertRaises(ValueError):
+            self.migrate(dependencies={"added": ["fixed"], "fixed": ["added"]})
+        with self.assertRaises(ValueError):
+            self.migrate(dependencies={"added": ["added"]})
+        with self.assertRaises(ValueError):
+            self.migrate(dependencies=["added"])
+        # An empty filtered selection or a selection without a required item.
+        with self.assertRaises(ValueError):
+            self.migrate(template={"items": [
+                {"id": "extra", "text": "Check changed", "required": False,
+                 "categories": ["Changed"]}]})
+        with self.assertRaises(ValueError):
+            self.migrate(template={"items": [
+                {"id": "gate", "text": "Gate build", "required": False}]})
+        # A missing store is treated as empty and reports unknown releases.
+        missing = ReleaseDesk(Path(self.temp.name) / "missing-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.migrate_checklist_with_dependencies(
+                "1.0.0", "2.0.0", self.checklist(), self.template(), {}, {})
+        self.assertFalse((Path(self.temp.name) / "missing-dir").exists())
+
+    def test_inputs_untouched_and_result_detached(self):
+        checklist = self.checklist()
+        template = self.template()
+        base_dependencies = {"added": ["fixed"]}
+        dependencies = {"added": ["fixed"], "fixed": ["extra"]}
+        snapshot = copy.deepcopy((checklist, template, base_dependencies, dependencies))
+        before = self.path.read_bytes()
+        result = self.migrate(checklist=checklist, template=template,
+                              base_dependencies=base_dependencies,
+                              dependencies=dependencies)
+        self.assertEqual((checklist, template, base_dependencies, dependencies), snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        result["items"][0]["id"] = "mutated"
+        result["dependencies"]["gate"].append("mutated")
+        result["includedPrerequisites"].append("mutated")
+        again = self.migrate()
+        self.assertEqual(again["items"][0]["id"], "gate")
+        self.assertEqual(again["dependencies"]["gate"], [])
+        self.assertEqual(again["includedPrerequisites"], ["extra"])
+
+    def test_cli_migrate_checklist_with_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        base_dependencies = Path(self.temp.name) / "base-dependencies.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        base_dependencies.write_text(json.dumps({"added": ["fixed"]}), encoding="utf-8")
+        dependencies.write_text(json.dumps({"added": ["fixed"], "fixed": ["extra"]}),
+                                encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist), str(template),
+                      "--base-dependencies", str(base_dependencies),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["retained"], ["gate"])
+        self.assertEqual(payload["reset"], ["added", "fixed"])
+        self.assertEqual(payload["added"], ["extra"])
+        self.assertEqual(payload["removed"], ["legacy"])
+        self.assertEqual(payload["includedPrerequisites"], ["extra"])
+        # Omitting both options keeps the original migrate-checklist behavior.
+        plain = subprocess.run(
+            prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist), str(template)],
+            capture_output=True, text=True)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertNotIn("dependencies", json.loads(plain.stdout))
+
+    def test_cli_migrate_checklist_with_dependencies_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        base_dependencies = Path(self.temp.name) / "base-dependencies.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        base_dependencies.write_text(json.dumps({"added": ["fixed"]}), encoding="utf-8")
+        dependencies.write_text(json.dumps({"added": ["fixed"]}), encoding="utf-8")
+        # The two options must be passed together.
+        for extra in (["--base-dependencies", str(base_dependencies)],
+                      ["--dependencies", str(dependencies)]):
+            result = subprocess.run(
+                prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist),
+                          str(template)] + extra,
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        both = ["--base-dependencies", str(base_dependencies),
+                "--dependencies", str(dependencies)]
+        for content in ("{not json", '{"added": ["fixed"], "added": ["fixed"]}'):
+            dependencies.write_text(content, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist),
+                          str(template)] + both,
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, content)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        dependencies.write_bytes(b"\xff\xfe")
+        result = subprocess.run(
+            prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist),
+                      str(template)] + both,
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        dependencies.write_text(json.dumps({"added": ["fixed"]}), encoding="utf-8")
+        base_dependencies.write_text('{"added": ["fixed"], "added": ["fixed"]}',
+                                     encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist),
+                      str(template)] + both,
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout), {"error": "duplicate JSON object key"})
+        absent = subprocess.run(
+            prefix + ["migrate-checklist", "1.0.0", "1.0.0", str(checklist), str(template),
+                      "--base-dependencies", str(Path(self.temp.name) / "nope.json"),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 class ConfigDiffTests(unittest.TestCase):
