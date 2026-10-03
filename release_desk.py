@@ -1,6 +1,7 @@
 """Store releases and render change notes grouped by category."""
 import argparse
 import copy
+import heapq
 import json
 import math
 import os
@@ -486,6 +487,86 @@ class ReleaseDesk:
             if item["required"] and effect != "done":
                 ready = False
         return {"version": version, "ready": ready, "items": result_items}
+
+    def explain_dependencies(self, version, checklist, dependencies):
+        # Read-only release-blocker explanation over the same inputs as
+        # check_dependencies: version, checklist, dependency and store rules
+        # are reused unchanged, and effective statuses follow the same
+        # declared-status-plus-blocking layer. From every required item that
+        # is not effectively done, the trace starts at the item itself and
+        # follows only prerequisites that are not effectively done. Every
+        # reached node declared pending or blocked is a reason (its own
+        # prerequisites are still traced); a reached node declared done only
+        # participates in paths. Optional items that never affect a required
+        # item are not listed. Nothing is written and the passed objects are
+        # never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        prerequisites = self._validated_dependencies(dependencies, {item["id"] for item in items})
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        status_by_id = {item["id"]: item["status"] for item in items}
+        effective = {}
+
+        def effective_status(item_id):
+            # The same memoized effective status check_dependencies computes.
+            if item_id not in effective:
+                status = status_by_id[item_id]
+                if any(effective_status(prerequisite) != "done"
+                       for prerequisite in prerequisites.get(item_id, ())):
+                    status = "blocked"
+                effective[item_id] = status
+            return effective[item_id]
+
+        position = {item["id"]: index for index, item in enumerate(items)}
+        reason_affected = {}
+        ready = True
+        for item in items:
+            start = item["id"]
+            if not item["required"] or effective_status(start) == "done":
+                continue
+            ready = False
+            # Best paths from the required item over the not-effectively-done
+            # subgraph: fewest edges first, ties broken by comparing path
+            # nodes by checklist position, first differing position decides.
+            # The (edges, positions) key is a monotone total order, so a
+            # Dijkstra-style relaxation settles each node with its best path.
+            best = {start: (0, (position[start],))}
+            paths = {start: [start]}
+            heap = [(best[start], start)]
+            while heap:
+                key, node = heapq.heappop(heap)
+                if key != best[node]:
+                    continue
+                for nxt in prerequisites.get(node, ()):
+                    if effective_status(nxt) == "done":
+                        continue
+                    candidate = (key[0] + 1, key[1] + (position[nxt],))
+                    if nxt not in best or candidate < best[nxt]:
+                        best[nxt] = candidate
+                        paths[nxt] = paths[node] + [nxt]
+                        heapq.heappush(heap, (candidate, nxt))
+            for node, path in paths.items():
+                if status_by_id[node] == "done":
+                    # Declared-done nodes only participate in paths.
+                    continue
+                reason_affected.setdefault(node, []).append({"id": start, "path": path})
+        reasons = []
+        # Reasons and their affected required items both follow checklist
+        # order; the required items were traced in that order, so each
+        # affected array is already ordered and holds one entry per item.
+        for item in items:
+            affected = reason_affected.get(item["id"])
+            if affected is None:
+                continue
+            reasons.append({"id": item["id"], "text": item["text"],
+                            "required": item["required"], "status": item["status"],
+                            "affected": affected})
+        return {"version": version, "ready": ready, "reasons": reasons}
 
     @staticmethod
     def _validated_dependencies(dependencies, known_ids):
@@ -1535,6 +1616,10 @@ def main():
     check_dependencies.add_argument("version")
     check_dependencies.add_argument("checklist")
     check_dependencies.add_argument("dependencies")
+    explain_dependencies = commands.add_parser("explain-dependencies")
+    explain_dependencies.add_argument("version")
+    explain_dependencies.add_argument("checklist")
+    explain_dependencies.add_argument("dependencies")
     make_checklist = commands.add_parser("make-checklist")
     make_checklist.add_argument("version")
     make_checklist.add_argument("file")
@@ -1687,6 +1772,17 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("dependencies file must contain UTF-8 encoded JSON") from exc
                 result = desk.check_dependencies(
+                    args.version, checklist_payload, dependencies_payload)
+            elif args.command == "explain-dependencies":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    dependencies_payload = _loads_unique(Path(args.dependencies).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("dependencies file must contain UTF-8 encoded JSON") from exc
+                result = desk.explain_dependencies(
                     args.version, checklist_payload, dependencies_payload)
             elif args.command == "make-checklist":
                 try:
