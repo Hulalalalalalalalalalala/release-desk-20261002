@@ -892,6 +892,299 @@ class ChecklistTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
 
+class CheckDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"}])
+
+    def payload(self, *items):
+        if not items:
+            items = (
+                {"id": "a", "text": "A", "required": True, "status": "done"},
+                {"id": "b", "text": "B", "required": True, "status": "done"},
+                {"id": "c", "text": "C", "required": False, "status": "pending"},
+            )
+        return {"version": "1.2.0", "items": list(items)}
+
+    def test_no_dependencies_matches_check(self):
+        for dependencies in ({}, {"a": [], "b": [], "c": []}):
+            report = self.desk.check_dependencies("1.2.0", self.payload(), dependencies)
+            self.assertEqual(set(report), {"version", "ready", "items"})
+            self.assertTrue(report["ready"])
+            self.assertEqual([item["id"] for item in report["items"]], ["a", "b", "c"])
+            for item in report["items"]:
+                self.assertEqual(set(item),
+                                 {"id", "text", "required", "status", "effectiveStatus", "waiting"})
+                self.assertEqual(item["effectiveStatus"], item["status"])
+                self.assertEqual(item["waiting"], [])
+
+    def test_chain_blocks_layer_by_layer_with_direct_only_waiting(self):
+        # The spec example: A depends on B, B on C; A and B declare done while
+        # C is pending. Both are blocked effectively, and A waits only on B.
+        payload = self.payload()
+        report = self.desk.check_dependencies("1.2.0", payload, {"a": ["b"], "b": ["c"]})
+        effects = {item["id"]: item for item in report["items"]}
+        self.assertFalse(report["ready"])
+        self.assertEqual(effects["a"]["status"], "done")
+        self.assertEqual(effects["a"]["effectiveStatus"], "blocked")
+        self.assertEqual(effects["a"]["waiting"], ["b"])
+        self.assertEqual(effects["b"]["effectiveStatus"], "blocked")
+        self.assertEqual(effects["b"]["waiting"], ["c"])
+        self.assertEqual(effects["c"]["effectiveStatus"], "pending")
+        self.assertEqual(effects["c"]["waiting"], [])
+
+    def test_undone_prerequisite_blocks_any_declared_status(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": True, "status": "blocked"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+        )
+        report = self.desk.check_dependencies("1.2.0", payload, {"a": ["c"], "b": ["c"]})
+        effects = {item["id"]: item["effectiveStatus"] for item in report["items"]}
+        self.assertEqual(effects, {"a": "blocked", "b": "blocked", "c": "pending"})
+
+    def test_waiting_lists_only_not_done_direct_prerequisites_in_array_order(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+            {"id": "d", "text": "D", "required": False, "status": "blocked"},
+        )
+        deps = {"a": ["b", "c", "d"]}
+        report = self.desk.check_dependencies("1.2.0", payload, deps)
+        item_a = report["items"][0]
+        # b is effectively done and drops out; waiting keeps only the not-done
+        # direct prerequisites in dependency-array order, never transitive ones.
+        self.assertEqual(item_a["waiting"], ["c", "d"])
+        self.assertEqual(item_a["effectiveStatus"], "blocked")
+
+    def test_optional_items_and_readiness(self):
+        # A blocked optional item never decides readiness on its own...
+        optional_blocked = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+        )
+        report = self.desk.check_dependencies("1.2.0", optional_blocked, {})
+        self.assertTrue(report["ready"])
+        # ...but an optional prerequisite still blocks a required dependent.
+        report = self.desk.check_dependencies(
+            "1.2.0", optional_blocked, {"a": ["b"]})
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["items"][0]["effectiveStatus"], "blocked")
+        # A required item declared done behind a chain of done optionals is ready.
+        chain = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "done"},
+        )
+        report = self.desk.check_dependencies("1.2.0", chain, {"a": ["b"], "b": ["c"]})
+        self.assertTrue(report["ready"])
+
+    def test_omitted_items_empty_arrays_and_normalized_fields(self):
+        payload = self.payload(
+            {"id": " a ", "text": " A ", "required": True, "status": "done"})
+        report = self.desk.check_dependencies("1.2.0", payload, {})
+        self.assertEqual(report["items"], [
+            {"id": "a", "text": "A", "required": True, "status": "done",
+             "effectiveStatus": "done", "waiting": []}])
+
+    def test_ids_trimmed_case_sensitive_without_unicode_normalization(self):
+        composed = "caf" + chr(0x00E9)
+        decomposed = "caf" + "e" + chr(0x0301)
+        payload = self.payload(
+            {"id": "A", "text": "Upper", "required": True, "status": "done"},
+            {"id": "a", "text": "Lower", "required": True, "status": "done"},
+            {"id": composed, "text": "Composed", "required": False, "status": "pending"},
+            {"id": decomposed, "text": "Decomposed", "required": False, "status": "pending"},
+        )
+        report = self.desk.check_dependencies(
+            "1.2.0", payload,
+            {" a ": [" " + composed + " "], " A ": [" " + decomposed + " "]})
+        effects = {item["id"]: item for item in report["items"]}
+        self.assertEqual(effects["a"]["waiting"], [composed])
+        self.assertEqual(effects["A"]["waiting"], [decomposed])
+        self.assertFalse(report["ready"])
+
+    def test_invalid_dependencies_structure(self):
+        payload = self.payload()
+        for dependencies in (None, [], "x", 1, {"a": "b"}, {"a": ["b"], "b": None}):
+            with self.assertRaises(ValueError):
+                self.desk.check_dependencies("1.2.0", payload, dependencies)
+
+    def test_invalid_dependency_ids(self):
+        payload = self.payload()
+        cases = [
+            {"": []},
+            {" ": []},
+            {"a\nb": []},
+            {"a\rb": []},
+            {1: []},
+            {"a": [""]},
+            {"a": [" "]},
+            {"a": ["b\nc"]},
+            {"a": [1]},
+            {"a": [None]},
+        ]
+        for dependencies in cases:
+            with self.assertRaises(ValueError):
+                self.desk.check_dependencies("1.2.0", payload, dependencies)
+
+    def test_duplicate_keys_and_prerequisites_rejected(self):
+        payload = self.payload()
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": [], " a ": []})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": ["b", " b "]})
+
+    def test_unknown_ends_self_dependency_and_cycles_rejected(self):
+        payload = self.payload()
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"z": []})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": ["z"]})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": ["a"]})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": ["b"], "b": ["a"]})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {"a": ["b"], "b": ["c"], "c": ["a"]})
+        # A cycle involving only optional items is rejected just the same.
+        optional_cycle = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "done"})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", optional_cycle, {"b": ["c"], "c": ["b"]})
+
+    def test_existing_version_checklist_and_store_checks_reused(self):
+        payload = self.payload()
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.check_dependencies(version, payload, {})
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("9.9.9", payload, {})
+        mismatched = {"version": "1.0.0", "items": payload["items"]}
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", mismatched, {})
+        raw = b'{"1.2.0": [{"category": "Added", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.check_dependencies("1.2.0", payload, {})
+
+    def test_missing_store_is_empty_and_unknown(self):
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        with self.assertRaises(ValueError):
+            desk.check_dependencies("1.2.0", self.payload(), {})
+
+    def test_readonly_inputs_untouched_and_result_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        payload = self.payload()
+        dependencies = {"a": ["b"], "b": ["c"]}
+        payload_snapshot = json.loads(json.dumps(payload))
+        deps_snapshot = json.loads(json.dumps(dependencies))
+        report = self.desk.check_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(payload, payload_snapshot)
+        self.assertEqual(dependencies, deps_snapshot)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        report["items"][0]["waiting"].append("c")
+        report["items"][0]["effectiveStatus"] = "done"
+        again = self.desk.check_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(again["items"][0]["waiting"], ["b"])
+        self.assertEqual(again["items"][0]["effectiveStatus"], "blocked")
+
+    def test_cli_check_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        ready_data = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": " Notes ", "required": True, "status": "done"},
+            {"id": "later", "text": "Later", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(ready_data), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["check-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "version": "1.2.0", "ready": True,
+            "items": [
+                {"id": "docs", "text": "Notes", "required": True, "status": "done",
+                 "effectiveStatus": "done", "waiting": []},
+                {"id": "later", "text": "Later", "required": False, "status": "pending",
+                 "effectiveStatus": "pending", "waiting": []}]})
+        # Not ready is still a successful single-line report.
+        dependencies.write_text(json.dumps({"docs": ["later"]}), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["check-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["items"][0]["effectiveStatus"], "blocked")
+        self.assertEqual(report["items"][0]["waiting"], ["later"])
+
+    def test_cli_check_dependencies_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        good_checklist = {"version": "1.2.0", "items": [
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        cases = [
+            ("{not json", "{}"),
+            (b"\xff\xfe", "{}"),
+            (json.dumps(good_checklist), "{not json"),
+            (json.dumps(good_checklist), b"\xff\xfe"),
+            ('{"version": "1.2.0", "version": "1.2.0", "items": []}', "{}"),
+            (json.dumps(good_checklist), '{"a": []}, "x": {}'),
+            (json.dumps(good_checklist), json.dumps({"a": ["a"]})),
+            (json.dumps(good_checklist), json.dumps({"a": ["b"], "b": ["a"]})),
+            (json.dumps(good_checklist), json.dumps({"z": []})),
+            (json.dumps(good_checklist), json.dumps({"a": ["z"]})),
+            (json.dumps({"version": "2.0.0", "items": good_checklist["items"]}), "{}"),
+        ]
+        for checklist_case, deps_case in cases:
+            if isinstance(checklist_case, bytes):
+                checklist.write_bytes(checklist_case)
+            else:
+                checklist.write_text(checklist_case, encoding="utf-8")
+            if isinstance(deps_case, bytes):
+                dependencies.write_bytes(deps_case)
+            else:
+                dependencies.write_text(deps_case, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["check-dependencies", "1.2.0", str(checklist), str(dependencies)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, (checklist_case, deps_case, result.stdout))
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        # Unknown version and missing files fail with one error line.
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["check-dependencies", "9.9.9", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        missing = directory / "nope.json"
+        for args in (["check-dependencies", "1.2.0", str(missing), str(dependencies)],
+                     ["check-dependencies", "1.2.0", str(checklist), str(missing)]):
+            result = subprocess.run(prefix + args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            self.assertFalse(missing.exists())
+        # Nothing was created beyond the two input files and the store.
+        self.assertEqual({path.name for path in directory.iterdir()},
+                         {"releases.json", "checklist.json", "dependencies.json"})
+
+
 class GenerateChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)

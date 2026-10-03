@@ -441,6 +441,113 @@ class ReleaseDesk:
         return {"version": version, "ready": ready,
                 "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"]}
 
+    def check_dependencies(self, version, checklist, dependencies):
+        # Read-only dependency-aware readiness check over a declared checklist:
+        # declared statuses are kept and a blocked effective status is layered
+        # on top from direct prerequisites that are not themselves effectively
+        # done. Nothing is written and the passed objects are never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        prerequisites = self._validated_dependencies(dependencies, {item["id"] for item in items})
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        status_by_id = {item["id"]: item["status"] for item in items}
+        effective = {}
+
+        def effective_status(item_id):
+            # Memoized effective status over the validated acyclic graph. A
+            # declaration counts only when every direct prerequisite is
+            # effectively done; otherwise the item is blocked no matter what
+            # it declared, so blocking propagates layer by layer without
+            # listing transitive prerequisites.
+            if item_id not in effective:
+                status = status_by_id[item_id]
+                if any(effective_status(prerequisite) != "done"
+                       for prerequisite in prerequisites.get(item_id, ())):
+                    status = "blocked"
+                effective[item_id] = status
+            return effective[item_id]
+
+        result_items, ready = [], True
+        for item in items:
+            item_id = item["id"]
+            effect = effective_status(item_id)
+            waiting = [prerequisite for prerequisite in prerequisites.get(item_id, ())
+                       if effective_status(prerequisite) != "done"]
+            result_items.append({"id": item["id"], "text": item["text"],
+                                 "required": item["required"], "status": item["status"],
+                                 "effectiveStatus": effect, "waiting": waiting})
+            # Optional items never decide readiness themselves, but an
+            # effectively blocked prerequisite keeps a required item blocked.
+            if item["required"] and effect != "done":
+                ready = False
+        return {"version": version, "ready": ready, "items": result_items}
+
+    @staticmethod
+    def _validated_dependencies(dependencies, known_ids):
+        # Validate the dependency map: an object mapping normalized item ids
+        # to arrays of normalized prerequisite ids, each following the
+        # checklist single-line id rule. Keys, array entries, unknown ends,
+        # self dependencies and cycles are all rejected; empty maps and empty
+        # arrays mean "no prerequisites".
+        if not isinstance(dependencies, dict):
+            raise ValueError("dependencies must be a JSON object")
+        normalized = {}
+        seen_keys = set()
+        for item_id, prerequisites in dependencies.items():
+            if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
+                raise ValueError("dependency item id must be a non-empty single-line string")
+            item_id = item_id.strip()
+            # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+            if item_id in seen_keys:
+                raise ValueError("dependency item id must be unique")
+            seen_keys.add(item_id)
+            if not isinstance(prerequisites, list):
+                raise ValueError("dependency prerequisites must be arrays of item ids")
+            ordered, seen = [], set()
+            for prerequisite in prerequisites:
+                if (not isinstance(prerequisite, str) or not prerequisite.strip()
+                        or "\n" in prerequisite or "\r" in prerequisite):
+                    raise ValueError("dependency item id must be a non-empty single-line string")
+                prerequisite = prerequisite.strip()
+                # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+                if prerequisite in seen:
+                    raise ValueError("dependency prerequisite ids must be unique within one item")
+                seen.add(prerequisite)
+                ordered.append(prerequisite)
+            normalized[item_id] = ordered
+        for item_id, prerequisites in normalized.items():
+            if item_id not in known_ids:
+                raise ValueError("dependency item id must exist in the checklist")
+            for prerequisite in prerequisites:
+                if prerequisite not in known_ids:
+                    raise ValueError("dependency prerequisite id must exist in the checklist")
+                if prerequisite == item_id:
+                    raise ValueError("dependencies must not contain a self dependency")
+        # Reject every remaining cycle, including cycles over optional items:
+        # resolve every id with an empty trail set.
+        visiting = set()
+        settled = set()
+
+        def visit(node):
+            if node in settled:
+                return
+            if node in visiting:
+                raise ValueError("dependencies must not contain a cycle")
+            visiting.add(node)
+            for prerequisite in normalized.get(node, ()):
+                visit(prerequisite)
+            visiting.remove(node)
+            settled.add(node)
+
+        for item_id in normalized:
+            visit(item_id)
+        return normalized
+
     def generate_checklist(self, version, payload):
         # Read-only checklist generated from a template: items are filtered by
         # the change categories actually registered for the release.
@@ -1314,6 +1421,10 @@ def main():
     check = commands.add_parser("check")
     check.add_argument("version")
     check.add_argument("file")
+    check_dependencies = commands.add_parser("check-dependencies")
+    check_dependencies.add_argument("version")
+    check_dependencies.add_argument("checklist")
+    check_dependencies.add_argument("dependencies")
     make_checklist = commands.add_parser("make-checklist")
     make_checklist.add_argument("version")
     make_checklist.add_argument("file")
@@ -1448,6 +1559,17 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("check file must contain UTF-8 encoded JSON") from exc
                 result = desk.checklist(args.version, payload)
+            elif args.command == "check-dependencies":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    dependencies_payload = _loads_unique(Path(args.dependencies).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("dependencies file must contain UTF-8 encoded JSON") from exc
+                result = desk.check_dependencies(
+                    args.version, checklist_payload, dependencies_payload)
             elif args.command == "make-checklist":
                 try:
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
