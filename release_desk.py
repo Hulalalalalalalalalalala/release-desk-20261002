@@ -850,6 +850,135 @@ class ReleaseDesk:
                 "done": groups["done"], "pending": groups["pending"], "blocked": groups["blocked"],
                 "missing": missing, "mismatched": mismatched, "unexpected": unexpected}
 
+    def audit_checklist_with_dependencies(self, version, checklist, template, dependencies):
+        # Read-only dependency-aware audit: the expected item set is generated
+        # exactly like generate_checklist_with_dependencies (category filter,
+        # then the direct and indirect prerequisite closure in template
+        # order), the audit follows audit_checklist against that final set,
+        # and the dependency report follows check_dependencies over the actual
+        # items plus the missing expected items appended in template order.
+        # Only dependency edges inside the final set take part; actual items
+        # outside it are treated as having no prerequisites. Nothing is
+        # written and the passed objects are never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        template_items = self._validated_template(template)
+        # The complete dependency graph is validated against the complete
+        # template, including items the category filter never selects.
+        prerequisites = self._validated_dependencies(
+            dependencies, {item["id"] for item in template_items})
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(template_items, records[version])
+        selected_ids = {item["id"] for item in selected}
+        # Close over every direct and indirect prerequisite of the selected
+        # items; shared prerequisites are collected once.
+        closure = set(selected_ids)
+        pending_nodes = list(selected_ids)
+        while pending_nodes:
+            node = pending_nodes.pop()
+            for prerequisite in prerequisites.get(node, ()):
+                if prerequisite not in closure:
+                    closure.add(prerequisite)
+                    pending_nodes.append(prerequisite)
+        # The final expected set keeps template order and template
+        # definitions with a uniform pending status.
+        expected = [{"id": item["id"], "text": item["text"],
+                     "required": item["required"], "status": "pending"}
+                    for item in template_items if item["id"] in closure]
+        # includedPrerequisites lists, in template order, only the items
+        # added solely because of a dependency edge.
+        included_prerequisites = [item["id"] for item in template_items
+                                  if item["id"] in closure and item["id"] not in selected_ids]
+        # The audit follows audit_checklist exactly, with the final expected
+        # set in place of the plainly filtered selection.
+        groups = {"done": [], "pending": [], "blocked": []}
+        audit_ready = True
+        for item in items:
+            groups[item["status"]].append(
+                {"id": item["id"], "text": item["text"],
+                 "required": item["required"], "status": item["status"]}
+            )
+            if item["required"] and item["status"] != "done":
+                audit_ready = False
+        # Ids match case-sensitively after trimming, without Unicode normalization.
+        actual_by_id = {item["id"]: item for item in items}
+        expected_ids = set()
+        missing, mismatched = [], []
+        for expected_item in expected:
+            expected_ids.add(expected_item["id"])
+            actual = actual_by_id.get(expected_item["id"])
+            if actual is None:
+                missing.append(dict(expected_item))
+            elif (actual["text"] != expected_item["text"]
+                  or actual["required"] != expected_item["required"]):
+                mismatched.append({
+                    "expected": dict(expected_item),
+                    "actual": {"id": actual["id"], "text": actual["text"],
+                               "required": actual["required"], "status": actual["status"]}})
+            else:
+                if expected_item["required"] and actual["status"] != "done":
+                    audit_ready = False
+                continue
+            # Differences in optional template items never affect readiness.
+            if expected_item["required"]:
+                audit_ready = False
+        unexpected = [
+            {"id": item["id"], "text": item["text"],
+             "required": item["required"], "status": item["status"]}
+            for item in items if item["id"] not in expected_ids
+        ]
+        audit = {"version": version, "ready": audit_ready,
+                 "done": groups["done"], "pending": groups["pending"],
+                 "blocked": groups["blocked"], "missing": missing,
+                 "mismatched": mismatched, "unexpected": unexpected}
+        # The dependency report lists the actual items in checklist order,
+        # then the missing expected items appended in template order with
+        # their template definitions and a pending status. Only edges inside
+        # the final set apply, so an actual item outside it has no
+        # prerequisites; every edge of an in-set item stays inside the set
+        # because the set is closed under prerequisites.
+        report_items = [dict(item) for item in items]
+        report_items.extend(dict(entry) for entry in missing)
+        status_by_id = {item["id"]: item["status"] for item in report_items}
+        effective = {}
+
+        def edges(item_id):
+            return prerequisites.get(item_id, ()) if item_id in closure else ()
+
+        def effective_status(item_id):
+            # The same memoized effective status as check_dependencies.
+            if item_id not in effective:
+                status = status_by_id[item_id]
+                if any(effective_status(prerequisite) != "done"
+                       for prerequisite in edges(item_id)):
+                    status = "blocked"
+                effective[item_id] = status
+            return effective[item_id]
+
+        dependency_items, dependency_ready = [], True
+        for item in report_items:
+            item_id = item["id"]
+            effect = effective_status(item_id)
+            waiting = [prerequisite for prerequisite in edges(item_id)
+                       if effective_status(prerequisite) != "done"]
+            dependency_items.append({"id": item_id, "text": item["text"],
+                                     "required": item["required"], "status": item["status"],
+                                     "effectiveStatus": effect, "waiting": waiting})
+            if item["required"] and effect != "done":
+                dependency_ready = False
+        dependency_check = {"version": version, "ready": dependency_ready,
+                            "items": dependency_items}
+        return {"version": version,
+                "ready": audit["ready"] and dependency_check["ready"],
+                "audit": audit,
+                "dependencyCheck": dependency_check,
+                "includedPrerequisites": included_prerequisites}
+
     def release_record(self, version, checklist, template, rollback):
         # Read-only release snapshot: the audit follows the existing
         # audit_checklist rules exactly, and a not-ready audit rejects the
@@ -1787,6 +1916,7 @@ def main():
     audit.add_argument("version")
     audit.add_argument("checklist")
     audit.add_argument("template")
+    audit.add_argument("--dependencies")
     record_release = commands.add_parser("record-release")
     record_release.add_argument("version")
     record_release.add_argument("checklist")
@@ -1980,7 +2110,17 @@ def main():
                     template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
-                result = desk.audit_checklist(args.version, checklist_payload, template_payload)
+                if args.dependencies is None:
+                    result = desk.audit_checklist(args.version, checklist_payload, template_payload)
+                else:
+                    try:
+                        dependencies_payload = _loads_unique(
+                            Path(args.dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "dependencies file must contain UTF-8 encoded JSON") from exc
+                    result = desk.audit_checklist_with_dependencies(
+                        args.version, checklist_payload, template_payload, dependencies_payload)
             elif args.command == "record-release":
                 try:
                     checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
