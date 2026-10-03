@@ -631,6 +631,43 @@ class ReleaseDesk:
                 "audit": copy.deepcopy(audit),
                 "rollback": {"targetVersion": target_version, "steps": steps}}
 
+    def release_record_with_dependencies(self, version, checklist, template, rollback, dependencies):
+        # Read-only dependency-frozen variant of release_record: the audit
+        # follows audit_checklist exactly (declared statuses are never rewritten
+        # by the dependency layer) and a dependency report follows
+        # check_dependencies exactly, reusing its format, validation, status
+        # propagation and ordering. The record is generated only when both
+        # reports are ready. The frozen dependencies map covers every
+        # normalized checklist id in checklist order; ids without declared
+        # prerequisites map to an empty array, and prerequisite ids keep their
+        # dependency-array order. Like release_record, the returned snapshot is
+        # detached from every passed object and carries no timestamp, so
+        # identical inputs yield identical records.
+        audit = self.audit_checklist(version, checklist, template)
+        if not audit["ready"]:
+            raise ValueError("release record requires a ready audit")
+        dependency_check = self.check_dependencies(version, checklist, dependencies)
+        if not dependency_check["ready"]:
+            raise ValueError("release record requires a ready dependency check")
+        target_version, steps = self._validated_rollback(rollback, version)
+        changes = self.export_releases([version])[version]
+        # The frozen map uses the same normalization as the dependency check:
+        # ids are trimmed and matched case-sensitively, prerequisite arrays
+        # keep their order, and every checklist id appears even when omitted.
+        known_ids = {item["id"] for item in dependency_check["items"]}
+        prerequisites = self._validated_dependencies(dependencies, known_ids)
+        frozen = {
+            item["id"]: list(prerequisites.get(item["id"], ()))
+            for item in dependency_check["items"]
+        }
+        return {"version": version,
+                "changes": copy.deepcopy(changes),
+                "notes": self.notes(version),
+                "audit": copy.deepcopy(audit),
+                "rollback": {"targetVersion": target_version, "steps": steps},
+                "dependencies": frozen,
+                "dependencyCheck": copy.deepcopy(dependency_check)}
+
     def _validated_rollback(self, rollback, release_version):
         # Validate the rollback plan: a strict {"targetVersion", "steps"}
         # object. targetVersion is null or a registered version numerically
@@ -1515,6 +1552,7 @@ def main():
     record_release.add_argument("checklist")
     record_release.add_argument("template")
     record_release.add_argument("rollback")
+    record_release.add_argument("--dependencies")
     record_release.add_argument("--output")
     reconcile = commands.add_parser("reconcile-checklist")
     reconcile.add_argument("version")
@@ -1684,18 +1722,35 @@ def main():
                     rollback_payload = _loads_unique(Path(args.rollback).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("rollback file must contain UTF-8 encoded JSON") from exc
-                result = desk.release_record(args.version, checklist_payload,
-                                             template_payload, rollback_payload)
+                if args.dependencies:
+                    # A missing dependency file raises OSError unchanged; bad
+                    # encoding, syntax and repeated keys become ValueError like
+                    # every other input file.
+                    try:
+                        dependencies_payload = _loads_unique(
+                            Path(args.dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "dependencies file must contain UTF-8 encoded JSON") from exc
+                    result = desk.release_record_with_dependencies(
+                        args.version, checklist_payload, template_payload,
+                        rollback_payload, dependencies_payload)
+                else:
+                    result = desk.release_record(args.version, checklist_payload,
+                                                 template_payload, rollback_payload)
                 if args.output:
                     output_path = Path(args.output)
                     # The snapshot target must be a brand-new path: an existing
                     # name or symlink (dangling ones included) is invalid input.
                     if output_path.exists() or output_path.is_symlink():
                         raise ValueError("release record output must not already exist")
-                    for label, other in (("store", desk.path),
-                                         ("checklist", Path(args.checklist)),
-                                         ("template", Path(args.template)),
-                                         ("rollback", Path(args.rollback))):
+                    input_files = [("store", desk.path),
+                                   ("checklist", Path(args.checklist)),
+                                   ("template", Path(args.template)),
+                                   ("rollback", Path(args.rollback))]
+                    if args.dependencies:
+                        input_files.append(("dependencies", Path(args.dependencies)))
+                    for label, other in input_files:
                         if _same_file(output_path, other):
                             raise ValueError(
                                 f"release record output must not be the same file as the {label} file")

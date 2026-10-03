@@ -4655,6 +4655,339 @@ class ReleaseRecordTests(unittest.TestCase):
         self.assertFalse(target.parent.exists())
 
 
+class ReleaseRecordWithDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.0.0", [{"category": "Fixed", "text": "Older fix"}])
+        self.desk.add("1.2.0", [
+            {"category": "Fixed", "text": "Retry exports"},
+            {"category": "Added", "text": "Export receipts"},
+        ])
+
+    def template(self, **overrides):
+        data = {"items": [
+            {"id": "docs", "text": " Write notes ", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+        ]}
+        data.update(overrides)
+        return data
+
+    def checklist(self, **overrides):
+        data = {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "done"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+        ]}
+        data.update(overrides)
+        return data
+
+    def rollback(self, target="1.0.0", steps=(" Stop service ", "Redeploy")):
+        value = list(steps) if isinstance(steps, (tuple, list)) else steps
+        return {"targetVersion": target, "steps": value}
+
+    def make(self, dependencies):
+        return self.desk.release_record_with_dependencies(
+            "1.2.0", self.checklist(), self.template(), self.rollback(), dependencies)
+
+    def test_record_shape_and_frozen_dependencies_content(self):
+        # "added" is done here so the relationship stays non-blocking and only
+        # freezing, normalization and ordering are under test.
+        ready_checklist = self.checklist()
+        ready_checklist["items"][2]["status"] = "done"
+        deps = {" fixed ": [" docs ", " added "], "docs": []}
+        record = self.desk.release_record_with_dependencies(
+            "1.2.0", ready_checklist, self.template(), self.rollback(), deps)
+        self.assertEqual(set(record),
+                         {"version", "changes", "notes", "audit", "rollback",
+                          "dependencies", "dependencyCheck"})
+        # Every normalized checklist id appears, in checklist order; omitted
+        # items and empty declarations both freeze to an empty array.
+        self.assertEqual(list(record["dependencies"]), ["docs", "fixed", "added"])
+        self.assertEqual(record["dependencies"],
+                         {"docs": [], "fixed": ["docs", "added"], "added": []})
+        # The five shared fields keep the release_record content exactly.
+        plain = self.desk.release_record(
+            "1.2.0", ready_checklist, self.template(), self.rollback())
+        for field in ("version", "changes", "notes", "audit", "rollback"):
+            self.assertEqual(record[field], plain[field])
+
+    def test_empty_dependencies_object_is_valid_and_adds_both_fields(self):
+        record = self.make({})
+        self.assertEqual(record["dependencies"], {"docs": [], "fixed": [], "added": []})
+        self.assertEqual(set(record["dependencyCheck"]), {"version", "ready", "items"})
+
+    def test_dependency_check_equals_full_report_for_same_inputs(self):
+        ready_checklist = self.checklist()
+        ready_checklist["items"][2]["status"] = "done"
+        for deps in ({}, {"fixed": ["docs"]}, {"fixed": ["docs", "added"]}):
+            record = self.desk.release_record_with_dependencies(
+                "1.2.0", ready_checklist, self.template(), self.rollback(), deps)
+            self.assertEqual(
+                record["dependencyCheck"],
+                self.desk.check_dependencies("1.2.0", ready_checklist, deps))
+
+    def test_audit_keeps_declared_statuses_and_remains_authoritative(self):
+        # An optional item declared done stays "done" in the audit even when the
+        # dependency layer computes it as blocked; the audit embedded in the
+        # record is the unchanged template audit.
+        template = self.template()
+        template["items"].append({"id": "later", "text": "Later work", "required": False})
+        checklist = self.checklist()
+        checklist["items"][2]["status"] = "done"
+        checklist["items"].append(
+            {"id": "later", "text": "Later work", "required": False, "status": "blocked"})
+        record = self.desk.release_record_with_dependencies(
+            "1.2.0", checklist, template, self.rollback(), {"added": ["later"]})
+        self.assertTrue(record["audit"]["ready"])
+        self.assertEqual(
+            record["audit"], self.desk.audit_checklist("1.2.0", checklist, template))
+        added_audit = next(item for item in record["audit"]["done"] if item["id"] == "added")
+        self.assertEqual(added_audit["status"], "done")
+        added_check = next(
+            item for item in record["dependencyCheck"]["items"] if item["id"] == "added")
+        self.assertEqual(added_check["status"], "done")
+        self.assertEqual(added_check["effectiveStatus"], "blocked")
+        self.assertEqual(added_check["waiting"], ["later"])
+        # The optional effective block never decides readiness on its own.
+        self.assertTrue(record["dependencyCheck"]["ready"])
+
+    def test_not_ready_audit_raises_even_with_trivial_dependencies(self):
+        pending = self.checklist()
+        pending["items"][0]["status"] = "pending"
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "1.2.0", pending, self.template(), self.rollback(), {})
+
+    def test_not_ready_dependency_check_raises(self):
+        # Direct: a required done item behind a pending optional is blocked.
+        with self.assertRaises(ValueError):
+            self.make({"docs": ["added"]})
+        # Indirect: blocking propagates through an optional chain, and the
+        # unfinished optional on its own would not block the record.
+        checklist = self.checklist()
+        with self.assertRaises(ValueError):
+            self.make({"docs": ["fixed"], "fixed": ["added"]})
+        self.assertFalse(
+            self.desk.check_dependencies("1.2.0", checklist, {"docs": ["fixed"], "fixed": ["added"]})
+            ["ready"])
+
+    def test_unfinished_optional_without_blocking_relationship_still_records(self):
+        record = self.make({"added": ["docs"]})
+        self.assertTrue(record["dependencyCheck"]["ready"])
+        self.assertEqual(record["dependencies"]["added"], ["docs"])
+
+    def test_invalid_dependency_structure_and_ids_propagate(self):
+        for dependencies in (None, [], "x", 1, {"docs": "fixed"}, {"docs": None}):
+            with self.assertRaises(ValueError):
+                self.make(dependencies)
+        for dependencies in (
+                {"": []}, {" ": []}, {"docs": [""]}, {"docs": [" "]},
+                {"docs": ["fixed\nx"]}, {1: []}, {"docs": [1]}, {"docs": [None]},
+                {"docs": [], " docs ": []}, {"docs": ["fixed", " fixed "]},
+                {"unknown": []}, {"docs": ["unknown"]},
+                {"docs": ["docs"]},
+                {"docs": ["fixed"], "fixed": ["docs"]},
+                {"docs": ["fixed"], "fixed": ["added"], "added": ["docs"]}):
+            with self.assertRaises(ValueError):
+                self.make(dependencies)
+
+    def test_existing_version_checklist_template_rollback_and_store_checks_reused(self):
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.release_record_with_dependencies(
+                    version, self.checklist(), self.template(), self.rollback(), {})
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "9.9.9", self.checklist(), self.template(), self.rollback(), {})
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "1.2.0", {"version": "1.2.0", "items": []}, self.template(),
+                self.rollback(), {})
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "1.2.0", self.checklist(version="1.0.0"), self.template(),
+                self.rollback(), {})
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "1.2.0", self.checklist(), {"items": []}, self.rollback(), {})
+        with self.assertRaises(ValueError):
+            self.desk.release_record_with_dependencies(
+                "1.2.0", self.checklist(), self.template(),
+                {"targetVersion": "2.0.0", "steps": ["x"]}, {})
+        raw = b'{"1.2.0": [{"category": "Added", "text": "x"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.make({})
+
+    def test_deterministic_detached_and_readonly(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist = self.checklist()
+        checklist["items"][2]["status"] = "done"
+        template, rollback = self.template(), self.rollback()
+        dependencies = {" fixed ": [" docs ", " added "]}
+        snapshot = json.loads(json.dumps(
+            {"checklist": checklist, "template": template,
+             "rollback": rollback, "dependencies": dependencies}))
+        first = self.desk.release_record_with_dependencies(
+            "1.2.0", checklist, template, rollback, dependencies)
+        second = self.desk.release_record_with_dependencies(
+            "1.2.0", checklist, template, rollback, dependencies)
+        self.assertEqual(first, second)
+        self.assertNotIn("time", json.dumps(first))
+        first["dependencies"]["fixed"].append("HACK")
+        first["dependencyCheck"]["items"][0]["waiting"].append("HACK")
+        first["audit"]["done"] = []
+        self.assertEqual({"checklist": checklist, "template": template,
+                          "rollback": rollback, "dependencies": dependencies}, snapshot)
+        third = self.desk.release_record_with_dependencies(
+            "1.2.0", checklist, template, rollback, dependencies)
+        self.assertEqual(third["dependencies"]["fixed"], ["docs", "added"])
+        self.assertEqual(third["dependencyCheck"]["items"][0]["waiting"], [])
+        self.assertEqual(len(third["audit"]["done"]), 3)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_record_release_with_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        rollback = Path(self.temp.name) / "rollback.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        rollback.write_text(json.dumps(self.rollback()), encoding="utf-8")
+        dependencies.write_text(json.dumps({" fixed ": [" docs "]}), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        record = json.loads(result.stdout)
+        self.assertEqual(set(record),
+                         {"version", "changes", "notes", "audit", "rollback",
+                          "dependencies", "dependencyCheck"})
+        self.assertEqual(record["dependencies"],
+                         {"docs": [], "fixed": ["docs"], "added": []})
+        # Omitting the option keeps the original five-field behavior.
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(set(json.loads(result.stdout)),
+                         {"version", "changes", "notes", "audit", "rollback"})
+
+    def test_cli_not_ready_dependency_check_fails(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        rollback = Path(self.temp.name) / "rollback.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        rollback.write_text(json.dumps(self.rollback()), encoding="utf-8")
+        dependencies.write_text(json.dumps({"docs": ["added"]}), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+
+    def test_cli_dependency_file_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        rollback = Path(self.temp.name) / "rollback.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        rollback.write_text(json.dumps(self.rollback()), encoding="utf-8")
+        cases = [
+            b"{not json",
+            b"\xff\xfe",
+            b'{"docs": []}, "x": {}',
+            b'{"docs": [], "docs": []}',
+            b'{"docs": {"a": 1, "a": 2}}',
+            json.dumps({"docs": ["docs"]}).encode("utf-8"),
+            json.dumps({"docs": ["fixed"], "fixed": ["docs"]}).encode("utf-8"),
+            json.dumps({"unknown": []}).encode("utf-8"),
+            b"[]",
+        ]
+        for raw in cases:
+            dependencies.write_bytes(raw)
+            result = subprocess.run(
+                prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                          "--dependencies", str(dependencies)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, raw)
+            self.assertEqual(result.stdout.count("\n"), 1)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        # A missing dependency file is an OSError: exit 2, no new file created.
+        missing = Path(self.temp.name) / "nope-deps.json"
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(missing)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        self.assertFalse(missing.exists())
+
+    def test_cli_output_rules_include_dependency_file(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        rollback = Path(self.temp.name) / "rollback.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        rollback.write_text(json.dumps(self.rollback()), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        target = Path(self.temp.name) / "record.json"
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies), "--output", str(target)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        console = json.loads(result.stdout)
+        raw = target.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), console)
+        # The dependency file is an input: using it as the output target fails
+        # and leaves its bytes untouched.
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies), "--output", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(dependencies.read_text(encoding="utf-8"), "{}")
+        # A failed dependency check with an output target leaves no new file.
+        failed_target = Path(self.temp.name) / "failed.json"
+        dependencies.write_text(json.dumps({"docs": ["added"]}), encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies), "--output", str(failed_target)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(failed_target.exists())
+        # A missing output parent is never created, and the dependency file
+        # stays byte-for-byte unchanged.
+        missing_dir_target = Path(self.temp.name) / "missing-dir" / "record.json"
+        deps_before = dependencies.read_bytes()
+        result = subprocess.run(
+            prefix + ["record-release", "1.2.0", str(checklist), str(template), str(rollback),
+                      "--dependencies", str(dependencies), "--output", str(missing_dir_target)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(missing_dir_target.exists())
+        self.assertFalse(missing_dir_target.parent.exists())
+        self.assertEqual(dependencies.read_bytes(), deps_before)
+
+
 class PreviewMergeChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
