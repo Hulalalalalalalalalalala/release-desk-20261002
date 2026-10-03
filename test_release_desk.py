@@ -1428,6 +1428,241 @@ class ExplainDependenciesTests(unittest.TestCase):
                          {"releases.json", "checklist.json", "dependencies.json"})
 
 
+class PlanDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Added", "text": "One"}])
+
+    def payload(self, *items):
+        return {"version": "1.2.0", "items": list(items)}
+
+    def test_ready_release_plans_nothing(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"})
+        report = self.desk.plan_dependencies("1.2.0", payload, {"a": ["b"]})
+        self.assertEqual(set(report), {"version", "ready", "waves", "blocked"})
+        self.assertEqual(report["version"], "1.2.0")
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["waves"], [])
+        self.assertEqual(report["blocked"], [])
+
+    def test_spec_example_chain_through_done_item(self):
+        # Required pending A depends on done B, B depends on pending C:
+        # C is scheduled first and A follows, B is never scheduled.
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"})
+        report = self.desk.plan_dependencies("1.2.0", payload, {"a": ["b"], "b": ["c"]})
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["waves"], [["c"], ["a"]])
+        self.assertEqual(report["blocked"], [])
+
+    def test_waves_batch_independent_items_in_checklist_order(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": True, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"},
+            {"id": "d", "text": "D", "required": False, "status": "pending"})
+        # a and b both wait on c; d is unrelated to any required item.
+        report = self.desk.plan_dependencies(
+            "1.2.0", payload, {"a": ["c"], "b": ["c"]})
+        self.assertEqual(report["waves"], [["c"], ["a", "b"]])
+        self.assertEqual(report["blocked"], [])
+
+    def test_blocked_items_are_scheduled_and_listed(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "blocked"},
+            {"id": "b", "text": "B", "required": True, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "blocked"},
+            {"id": "d", "text": "D", "required": False, "status": "blocked"})
+        # c is an in-scope optional prerequisite; d is blocked but out of scope.
+        report = self.desk.plan_dependencies("1.2.0", payload, {"b": ["a", "c"]})
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["waves"], [["a", "c"], ["b"]])
+        self.assertEqual(report["blocked"], ["a", "c"])
+
+    def test_scope_excludes_unrelated_unfinished_optionals(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "blocked"})
+        report = self.desk.plan_dependencies("1.2.0", payload, {"b": ["c"]})
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["waves"], [])
+        self.assertEqual(report["blocked"], [])
+
+    def test_dependency_order_and_key_order_do_not_matter(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"},
+            {"id": "c", "text": "C", "required": False, "status": "pending"})
+        first = self.desk.plan_dependencies(
+            "1.2.0", payload, {"a": ["b", "c"], "b": ["c"]})
+        second = self.desk.plan_dependencies(
+            "1.2.0", payload, {"b": ["c"], "a": ["c", "b"]})
+        self.assertEqual(first, second)
+        self.assertEqual(first["waves"], [["c"], ["b"], ["a"]])
+
+    def test_done_prerequisite_chain_passes_through_multiple_done_items(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "done"},
+            {"id": "c", "text": "C", "required": False, "status": "done"},
+            {"id": "d", "text": "D", "required": False, "status": "pending"})
+        report = self.desk.plan_dependencies(
+            "1.2.0", payload, {"a": ["b"], "b": ["c"], "c": ["d"]})
+        self.assertEqual(report["waves"], [["d"], ["a"]])
+
+    def test_ready_matches_check_dependencies(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "done"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"})
+        for dependencies in ({}, {"a": ["b"]}):
+            plan = self.desk.plan_dependencies("1.2.0", payload, dependencies)
+            check = self.desk.check_dependencies("1.2.0", payload, dependencies)
+            self.assertEqual(plan["ready"], check["ready"])
+
+    def test_existing_validation_reused(self):
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"})
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.desk.plan_dependencies(version, payload, {})
+        with self.assertRaises(ValueError):
+            self.desk.plan_dependencies("9.9.9", payload, {})
+        mismatched = {"version": "1.0.0", "items": payload["items"]}
+        with self.assertRaises(ValueError):
+            self.desk.plan_dependencies("1.2.0", mismatched, {})
+        for dependencies in (None, [], {"a": "b"}, {"a": [], " a ": []},
+                             {"a": ["b", " b "]}, {"z": []}, {"a": ["z"]},
+                             {"a": ["a"]}, {"a": ["b"], "b": ["a"]}):
+            with self.assertRaises(ValueError):
+                self.desk.plan_dependencies("1.2.0", payload, dependencies)
+        raw = b'{"1.2.0": [{"category": "Added", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.desk.plan_dependencies("1.2.0", payload, {})
+
+    def test_missing_store_is_empty_and_unknown(self):
+        desk = ReleaseDesk(Path(self.temp.name) / "missing" / "releases.json")
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"})
+        with self.assertRaises(ValueError):
+            desk.plan_dependencies("1.2.0", payload, {})
+
+    def test_readonly_inputs_untouched_and_result_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        payload = self.payload(
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"})
+        dependencies = {"a": ["b"]}
+        payload_snapshot = json.loads(json.dumps(payload))
+        report = self.desk.plan_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(payload, payload_snapshot)
+        self.assertEqual(dependencies, {"a": ["b"]})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+        report["waves"][0].append("x")
+        report["blocked"].append("x")
+        again = self.desk.plan_dependencies("1.2.0", payload, dependencies)
+        self.assertEqual(again["waves"], [["b"], ["a"]])
+        self.assertEqual(again["blocked"], [])
+
+    def test_cli_plan_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        checklist.write_text(json.dumps({"version": "1.2.0", "items": [
+            {"id": "docs", "text": " Notes ", "required": True, "status": "pending"},
+            {"id": "build", "text": "Build", "required": False, "status": "done"},
+            {"id": "tag", "text": "Tag", "required": False, "status": "blocked"}]}),
+            encoding="utf-8")
+        dependencies.write_text(json.dumps({"docs": ["build"], "build": ["tag"]}),
+                                encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["plan-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "version": "1.2.0", "ready": False,
+            "waves": [["tag"], ["docs"]], "blocked": ["tag"]})
+        # A ready release also exits 0 with empty plan arrays.
+        checklist.write_text(json.dumps({"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Notes", "required": True, "status": "done"}]}),
+            encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["plan-dependencies", "1.2.0", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {
+            "version": "1.2.0", "ready": True, "waves": [], "blocked": []})
+
+    def test_cli_plan_dependencies_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        directory = Path(self.temp.name)
+        checklist = directory / "checklist.json"
+        dependencies = directory / "dependencies.json"
+        good_checklist = {"version": "1.2.0", "items": [
+            {"id": "a", "text": "A", "required": True, "status": "pending"},
+            {"id": "b", "text": "B", "required": False, "status": "pending"}]}
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        cases = [
+            ("{not json", "{}"),
+            (b"\xff\xfe", "{}"),
+            (json.dumps(good_checklist), "{not json"),
+            (json.dumps(good_checklist), b"\xff\xfe"),
+            ('{"version": "1.2.0", "version": "1.2.0", "items": []}', "{}"),
+            (json.dumps(good_checklist), '{"a": [], "a": []}'),
+            (json.dumps(good_checklist), json.dumps({"a": ["a"]})),
+            (json.dumps(good_checklist), json.dumps({"a": ["b"], "b": ["a"]})),
+            (json.dumps(good_checklist), json.dumps({"z": []})),
+            (json.dumps(good_checklist), json.dumps({"a": ["z"]})),
+            (json.dumps({"version": "2.0.0", "items": good_checklist["items"]}), "{}"),
+        ]
+        for checklist_case, deps_case in cases:
+            if isinstance(checklist_case, bytes):
+                checklist.write_bytes(checklist_case)
+            else:
+                checklist.write_text(checklist_case, encoding="utf-8")
+            if isinstance(deps_case, bytes):
+                dependencies.write_bytes(deps_case)
+            else:
+                dependencies.write_text(deps_case, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["plan-dependencies", "1.2.0", str(checklist), str(dependencies)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, (checklist_case, deps_case, result.stdout))
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        # Unknown version and missing files fail with one error line.
+        checklist.write_text(json.dumps(good_checklist), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["plan-dependencies", "9.9.9", str(checklist), str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stdout))
+        missing = directory / "nope.json"
+        for args in (["plan-dependencies", "1.2.0", str(missing), str(dependencies)],
+                     ["plan-dependencies", "1.2.0", str(checklist), str(missing)]):
+            result = subprocess.run(prefix + args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("error", json.loads(result.stdout))
+            self.assertFalse(missing.exists())
+        # Nothing was created beyond the two input files and the store.
+        self.assertEqual({path.name for path in directory.iterdir()},
+                         {"releases.json", "checklist.json", "dependencies.json"})
+
+
 class GenerateChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
