@@ -569,6 +569,99 @@ class ReleaseDesk:
                             "affected": affected})
         return {"version": version, "ready": ready, "reasons": reasons}
 
+    def plan_dependencies(self, version, checklist, dependencies):
+        # Read-only release preparation order plan layered on
+        # check_dependencies: the same validation and readiness rule, but the
+        # report batches the unfinished work still required for release. The
+        # planning scope is every required item together with all of its direct
+        # and indirect prerequisites, traversing declared-done nodes; only
+        # items declared pending or blocked inside that scope are scheduled.
+        # Nothing is written and the passed objects are never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        prerequisites = self._validated_dependencies(dependencies, {item["id"] for item in items})
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        status_by_id = {item["id"]: item["status"] for item in items}
+        effective = {}
+
+        def effective_status(item_id):
+            # The same memoized effective status as check_dependencies.
+            if item_id not in effective:
+                status = status_by_id[item_id]
+                if any(effective_status(prerequisite) != "done"
+                       for prerequisite in prerequisites.get(item_id, ())):
+                    status = "blocked"
+                effective[item_id] = status
+            return effective[item_id]
+
+        # Mark the planning scope: every required item plus every item reached
+        # by following prerequisites from a required item. Edges out of
+        # declared-done nodes are followed too, so an unfinished prerequisite
+        # behind a done chain stays in scope; an optional branch no required
+        # item reaches never enters the plan.
+        scope = set()
+
+        def mark_scope(node):
+            if node in scope:
+                return
+            scope.add(node)
+            for prerequisite in prerequisites.get(node, ()):
+                mark_scope(prerequisite)
+
+        for item in items:
+            if item["required"]:
+                mark_scope(item["id"])
+        ready = all(effective_status(item["id"]) == "done"
+                    for item in items if item["required"])
+        # Reduce the prerequisite edges past declared-done nodes: an item's
+        # effective unfinished prerequisites are its direct unfinished
+        # prerequisites plus the unfinished prerequisites of any done direct
+        # prerequisite, recursively. The indirect relation through a done
+        # node therefore still orders the plan, while the done node itself is
+        # never scheduled. Every reached prerequisite lies in scope because
+        # mark_scope followed the same edges.
+        reduced = {}
+
+        def unfinished_prerequisites(node):
+            if node not in reduced:
+                closure = set()
+                for prerequisite in prerequisites.get(node, ()):
+                    if status_by_id[prerequisite] == "done":
+                        closure.update(unfinished_prerequisites(prerequisite))
+                    else:
+                        closure.add(prerequisite)
+                reduced[node] = closure
+            return reduced[node]
+
+        # Batch the unfinished scope items: each wave takes every not-yet-
+        # scheduled item whose effective unfinished prerequisites are all in
+        # earlier waves. The validated acyclic graph guarantees progress, so
+        # the waves stay compact (no empty batch) and end with the pool empty.
+        remaining = {item["id"] for item in items
+                     if item["id"] in scope and status_by_id[item["id"]] != "done"}
+        scheduled = set()
+        waves = []
+        while remaining:
+            current = []
+            for item in items:
+                item_id = item["id"]
+                if item_id in remaining and unfinished_prerequisites(item_id) <= scheduled:
+                    current.append(item_id)
+            scheduled.update(current)
+            remaining.difference_update(current)
+            waves.append(current)
+        # blocked lists scope items declared blocked in checklist order,
+        # independently of the waves; being planned never clears the block.
+        blocked = [item["id"] for item in items
+                   if item["id"] in scope and status_by_id[item["id"]] == "blocked"]
+        return {"version": version, "ready": ready,
+                "waves": waves, "blocked": blocked}
+
     @staticmethod
     def _validated_dependencies(dependencies, known_ids):
         # Validate the dependency map: an object mapping normalized item ids
@@ -1621,6 +1714,10 @@ def main():
     explain_dependencies.add_argument("version")
     explain_dependencies.add_argument("checklist")
     explain_dependencies.add_argument("dependencies")
+    plan_dependencies = commands.add_parser("plan-dependencies")
+    plan_dependencies.add_argument("version")
+    plan_dependencies.add_argument("checklist")
+    plan_dependencies.add_argument("dependencies")
     make_checklist = commands.add_parser("make-checklist")
     make_checklist.add_argument("version")
     make_checklist.add_argument("file")
@@ -1784,6 +1881,17 @@ def main():
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("dependencies file must contain UTF-8 encoded JSON") from exc
                 result = desk.explain_dependencies(
+                    args.version, checklist_payload, dependencies_payload)
+            elif args.command == "plan-dependencies":
+                try:
+                    checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("checklist file must contain UTF-8 encoded JSON") from exc
+                try:
+                    dependencies_payload = _loads_unique(Path(args.dependencies).read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError("dependencies file must contain UTF-8 encoded JSON") from exc
+                result = desk.plan_dependencies(
                     args.version, checklist_payload, dependencies_payload)
             elif args.command == "make-checklist":
                 try:
