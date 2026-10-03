@@ -209,18 +209,54 @@ def _preview_config_values(base, target, current, path, conflicts):
 
 def _validated_merge_choices(decisions):
     # Validate the checklist conflict-choice map before it is applied: a JSON
-    # object, possibly empty, with string keys mapping only to "incoming" or
-    # "current". Membership against actual conflict ids is checked afterwards.
+    # object, possibly empty, with string keys mapping to "incoming", "current"
+    # or a strict custom decision object: {"present": true, "value": item}
+    # replaces the whole item and {"present": false} deletes it. Custom items
+    # follow the checklist item rules and their normalized id must equal the
+    # decision key. Membership against actual conflict ids is checked
+    # afterwards.
     if not isinstance(decisions, dict):
         raise ValueError("merge decisions must be a JSON object")
     normalized = {}
     for item_id, choice in decisions.items():
         if not isinstance(item_id, str):
             raise ValueError("decision keys must be strings")
-        if choice not in ("incoming", "current"):
-            raise ValueError("decision choice must be incoming or current")
-        normalized[item_id] = choice
+        if isinstance(choice, str):
+            if choice not in ("incoming", "current"):
+                raise ValueError(
+                    "decision choice must be incoming, current or a custom decision object")
+            normalized[item_id] = choice
+        elif isinstance(choice, dict):
+            normalized[item_id] = _validated_custom_merge_choice(item_id, choice)
+        else:
+            raise ValueError(
+                "decision choice must be incoming, current or a custom decision object")
     return normalized
+
+
+def _validated_custom_merge_choice(item_id, choice):
+    # Validate one custom checklist decision: present is a strict boolean and
+    # the object has no other shape. A present decision carries a single whole
+    # checklist value with exactly id, text, required and status, validated and
+    # trimmed like a checklist item; its normalized id must equal the decision
+    # key exactly, with no trimming or Unicode normalization of the key. An
+    # absent decision carries only present and deletes the item.
+    if "present" not in choice:
+        raise ValueError("custom decision requires a boolean present")
+    present = choice["present"]
+    if not isinstance(present, bool):
+        raise ValueError("custom decision present must be a boolean")
+    fields = set(choice)
+    if present:
+        if fields != {"present", "value"}:
+            raise ValueError("a present custom decision requires only present and value")
+        item = ReleaseDesk._validated_checklist_item(choice["value"], strict=True)
+        if item["id"] != item_id:
+            raise ValueError("custom item id must equal the decision conflict id")
+        return {"present": True, "value": item}
+    if fields != {"present"}:
+        raise ValueError("an absent custom decision requires only present")
+    return {"present": False}
 
 
 def _version_order(version):
@@ -1505,10 +1541,15 @@ class ReleaseDesk:
 
     def resolve_merge_checklist(self, version, base, incoming, current, decisions):
         # Read-only confirmation layer over preview_merge_checklist: decisions
-        # maps original preview conflict ids to "incoming" or "current"; empty
-        # and partial maps are allowed. A chosen side is adopted as one whole
-        # item and choosing a side that lacks the id deletes the item.
-        # Unchosen conflicts keep their original details and the current side.
+        # maps original preview conflict ids to "incoming", "current" or a
+        # custom decision object; empty and partial maps are allowed and the
+        # two shapes may be mixed. A chosen side is adopted as one whole item
+        # and choosing a side that lacks the id deletes the item. A custom
+        # decision replaces the whole item with its value (present true) or
+        # deletes it (present false); even a value equal to one of the sides,
+        # or deleting an item the current side already lacks, is recorded as
+        # "custom". Unchosen conflicts keep their original details and the
+        # current side.
         if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
             raise ValueError("version must have three nonnegative numeric components")
         base_items = self._validated_checklist(base, version)
@@ -1532,18 +1573,26 @@ class ReleaseDesk:
         for item_id in choices:
             if item_id not in conflict_ids:
                 raise ValueError("decision id is not a conflict id")
-        resolved = [{"id": item_id, "choice": choice}
-                    for item_id, choice in choices.items()]
-        # Apply the confirmed whole-item choices over the preview plan. A side
-        # lacking the id deletes the item; building from deep copies keeps
-        # every passed object untouched, and confirming an unchanged current
-        # side still counts as resolved.
+        # Apply the confirmed decisions over the preview plan. A side lacking
+        # the id deletes the item; a custom value replaces the whole item and
+        # a present-false custom decision deletes it. Building from deep copies
+        # keeps every passed object untouched, and confirming an unchanged
+        # current side still counts as resolved.
         incoming_by_id = {item["id"]: item for item in incoming_items}
         current_by_id = {item["id"]: item for item in current_items}
-        chosen_by_id = {entry["id"]: entry["choice"] for entry in resolved}
-        for item_id, choice in chosen_by_id.items():
-            side = incoming_by_id if choice == "incoming" else current_by_id
-            merged[item_id] = copy.deepcopy(side.get(item_id))
+        resolved, chosen_by_id = [], {}
+        for item_id, choice in choices.items():
+            if isinstance(choice, str):
+                side = incoming_by_id if choice == "incoming" else current_by_id
+                merged[item_id] = copy.deepcopy(side.get(item_id))
+                chosen_by_id[item_id] = choice
+                resolved.append({"id": item_id, "choice": choice})
+            else:
+                # The custom value replaces the whole item, even when it
+                # equals one of the sides or only changes its presence.
+                merged[item_id] = copy.deepcopy(choice["value"]) if choice["present"] else None
+                chosen_by_id[item_id] = "custom"
+                resolved.append({"id": item_id, "choice": "custom"})
         items = self._ordered_merge_items(merged, incoming_items, current_items)
         self._validate_merge_items(items)
         remaining = [entry for entry in conflicts if entry["id"] not in chosen_by_id]
@@ -1558,7 +1607,8 @@ class ReleaseDesk:
                               current_path):
         # Confirmed three-way checklist merge written back to a local file:
         # the target is read, checked against the expected snapshot, resolved
-        # exactly like resolve_merge_checklist and, only when the normalized
+        # exactly like resolve_merge_checklist (string and custom decisions
+        # mixed, partially confirmed or not) and, only when the normalized
         # item sequence changes, replaced wholesale with UTF-8 JSON holding
         # just version and items and ending in a newline. Any remaining
         # conflict rejects the save; nothing else is modified.
@@ -1607,15 +1657,21 @@ class ReleaseDesk:
         for item_id in choices:
             if item_id not in conflict_ids:
                 raise ValueError("decision id is not a conflict id")
-        # Apply the confirmed whole-item choices over the preview plan,
-        # building from deep copies so every passed object stays untouched.
+        # Apply the confirmed decisions over the preview plan, building from
+        # deep copies so every passed object stays untouched. String choices
+        # adopt one whole side; a custom choice replaces the whole item or
+        # deletes it and records "custom" even when its value matches a side.
         incoming_by_id = {item["id"]: item for item in incoming_items}
         current_by_id = {item["id"]: item for item in current_items}
-        resolved = [{"id": item_id, "choice": choice}
-                    for item_id, choice in choices.items()]
+        resolved = []
         for item_id, choice in choices.items():
-            side = incoming_by_id if choice == "incoming" else current_by_id
-            merged[item_id] = copy.deepcopy(side.get(item_id))
+            if isinstance(choice, str):
+                side = incoming_by_id if choice == "incoming" else current_by_id
+                merged[item_id] = copy.deepcopy(side.get(item_id))
+                resolved.append({"id": item_id, "choice": choice})
+            else:
+                merged[item_id] = copy.deepcopy(choice["value"]) if choice["present"] else None
+                resolved.append({"id": item_id, "choice": "custom"})
         items = self._ordered_merge_items(merged, incoming_items, current_items)
         self._validate_merge_items(items)
         if any(entry["id"] not in choices for entry in conflicts):
@@ -1830,6 +1886,33 @@ class ReleaseDesk:
         return normalized
 
     @staticmethod
+    def _validated_checklist_item(item, *, strict=False):
+        # Validate and normalize one checklist item: id, text, required and
+        # status follow the same rules everywhere, trimming id and text ends.
+        # strict additionally rejects missing or extra fields, which a custom
+        # decision value must never carry (a declared checklist may keep
+        # unknown fields that normalization ignores).
+        if not isinstance(item, dict):
+            raise ValueError("checklist items require id, text, required and status")
+        if strict and set(item) != {"id", "text", "required", "status"}:
+            raise ValueError(
+                "custom checklist value requires exactly id, text, required and status")
+        item_id, text, required, status = (
+            item.get("id"), item.get("text"), item.get("required"), item.get("status"))
+        if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
+            raise ValueError("checklist item id must be a non-empty single-line string")
+        if not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
+            raise ValueError("checklist item text must be a non-empty single-line string")
+        if not isinstance(required, bool):
+            raise ValueError("checklist item required must be a boolean")
+        if status not in CHECK_STATUSES:
+            raise ValueError("checklist item status must be done, pending or blocked")
+        item_id = item_id.strip()
+        # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+        return {"id": item_id, "text": text.strip(),
+                "required": required, "status": status}
+
+    @staticmethod
     def _validated_checklist(payload, version):
         if not isinstance(payload, dict):
             raise ValueError("checklist must be a JSON object")
@@ -1844,25 +1927,12 @@ class ReleaseDesk:
         normalized = []
         seen = set()
         for item in items:
-            if not isinstance(item, dict):
-                raise ValueError("checklist items require id, text, required and status")
-            item_id, text, required, status = (
-                item.get("id"), item.get("text"), item.get("required"), item.get("status"))
-            if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
-                raise ValueError("checklist item id must be a non-empty single-line string")
-            if not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
-                raise ValueError("checklist item text must be a non-empty single-line string")
-            if not isinstance(required, bool):
-                raise ValueError("checklist item required must be a boolean")
-            if status not in CHECK_STATUSES:
-                raise ValueError("checklist item status must be done, pending or blocked")
-            item_id = item_id.strip()
-            # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+            entry = ReleaseDesk._validated_checklist_item(item)
+            item_id = entry["id"]
             if item_id in seen:
                 raise ValueError("checklist item id must be unique")
             seen.add(item_id)
-            normalized.append({"id": item_id, "text": text.strip(),
-                               "required": required, "status": status})
+            normalized.append(entry)
         if not any(item["required"] for item in normalized):
             raise ValueError("checklist requires at least one required item")
         return normalized
