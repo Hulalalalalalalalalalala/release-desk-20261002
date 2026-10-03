@@ -207,19 +207,63 @@ def _preview_config_values(base, target, current, path, conflicts):
     return preview
 
 
+def _validated_merge_custom_choice(choice):
+    # Validate one custom merge decision: a strict {"present": bool} object.
+    # A present decision additionally holds exactly "value", a whole checklist
+    # item whose fields follow the checklist validation and trimming rules; an
+    # absent decision holds nothing else and deletes the item.
+    present = choice.get("present")
+    if not isinstance(present, bool):
+        raise ValueError("custom decision present must be a boolean")
+    fields = set(choice)
+    if not present:
+        if fields != {"present"}:
+            raise ValueError("an absent custom decision requires only present")
+        return {"present": False}
+    if fields != {"present", "value"}:
+        raise ValueError("a present custom decision requires only present and value")
+    value = choice["value"]
+    if not isinstance(value, dict) or set(value) != {"id", "text", "required", "status"}:
+        raise ValueError("custom decision value requires exactly id, text, required and status")
+    item_id, text, required, status = (
+        value["id"], value["text"], value["required"], value["status"])
+    if not isinstance(item_id, str) or not item_id.strip() or "\n" in item_id or "\r" in item_id:
+        raise ValueError("checklist item id must be a non-empty single-line string")
+    if not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
+        raise ValueError("checklist item text must be a non-empty single-line string")
+    if not isinstance(required, bool):
+        raise ValueError("checklist item required must be a boolean")
+    if status not in CHECK_STATUSES:
+        raise ValueError("checklist item status must be done, pending or blocked")
+    # Case-sensitive, no trimming beyond the ends, no Unicode normalization.
+    return {"present": True, "value": {"id": item_id.strip(), "text": text.strip(),
+                                       "required": required, "status": status}}
+
+
 def _validated_merge_choices(decisions):
     # Validate the checklist conflict-choice map before it is applied: a JSON
-    # object, possibly empty, with string keys mapping only to "incoming" or
-    # "current". Membership against actual conflict ids is checked afterwards.
+    # object, possibly empty, with string keys mapping to "incoming",
+    # "current" or a custom {"present", "value"?} decision object. Custom
+    # values are normalized like checklist items and the normalized id must
+    # equal the decision key. Membership against actual conflict ids is
+    # checked afterwards.
     if not isinstance(decisions, dict):
         raise ValueError("merge decisions must be a JSON object")
     normalized = {}
     for item_id, choice in decisions.items():
         if not isinstance(item_id, str):
             raise ValueError("decision keys must be strings")
-        if choice not in ("incoming", "current"):
-            raise ValueError("decision choice must be incoming or current")
-        normalized[item_id] = choice
+        if isinstance(choice, str):
+            if choice not in ("incoming", "current"):
+                raise ValueError("decision choice must be incoming, current or a custom decision object")
+            normalized[item_id] = choice
+        elif isinstance(choice, dict):
+            custom = _validated_merge_custom_choice(choice)
+            if custom["present"] and custom["value"]["id"] != item_id:
+                raise ValueError("custom decision id must match the decision key")
+            normalized[item_id] = custom
+        else:
+            raise ValueError("decision choice must be incoming, current or a custom decision object")
     return normalized
 
 
@@ -1505,10 +1549,13 @@ class ReleaseDesk:
 
     def resolve_merge_checklist(self, version, base, incoming, current, decisions):
         # Read-only confirmation layer over preview_merge_checklist: decisions
-        # maps original preview conflict ids to "incoming" or "current"; empty
-        # and partial maps are allowed. A chosen side is adopted as one whole
-        # item and choosing a side that lacks the id deletes the item.
-        # Unchosen conflicts keep their original details and the current side.
+        # maps original preview conflict ids to "incoming", "current" or a
+        # custom {"present", "value"?} object; empty and partial maps are
+        # allowed and strings and custom objects may be mixed. A chosen side
+        # is adopted as one whole item and choosing a side that lacks the id
+        # deletes the item; a custom value replaces the item wholesale and a
+        # custom absent decision deletes it. Unchosen conflicts keep their
+        # original details and the current side.
         if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
             raise ValueError("version must have three nonnegative numeric components")
         base_items = self._validated_checklist(base, version)
@@ -1532,21 +1579,10 @@ class ReleaseDesk:
         for item_id in choices:
             if item_id not in conflict_ids:
                 raise ValueError("decision id is not a conflict id")
-        resolved = [{"id": item_id, "choice": choice}
-                    for item_id, choice in choices.items()]
-        # Apply the confirmed whole-item choices over the preview plan. A side
-        # lacking the id deletes the item; building from deep copies keeps
-        # every passed object untouched, and confirming an unchanged current
-        # side still counts as resolved.
-        incoming_by_id = {item["id"]: item for item in incoming_items}
-        current_by_id = {item["id"]: item for item in current_items}
-        chosen_by_id = {entry["id"]: entry["choice"] for entry in resolved}
-        for item_id, choice in chosen_by_id.items():
-            side = incoming_by_id if choice == "incoming" else current_by_id
-            merged[item_id] = copy.deepcopy(side.get(item_id))
+        resolved = self._apply_merge_choices(merged, choices, incoming_items, current_items)
         items = self._ordered_merge_items(merged, incoming_items, current_items)
         self._validate_merge_items(items)
-        remaining = [entry for entry in conflicts if entry["id"] not in chosen_by_id]
+        remaining = [entry for entry in conflicts if entry["id"] not in choices]
         ready = all(item["status"] == "done" for item in items if item["required"])
         # Ids sort by Unicode code point, not by locale.
         remaining.sort(key=lambda entry: entry["id"])
@@ -1607,15 +1643,9 @@ class ReleaseDesk:
         for item_id in choices:
             if item_id not in conflict_ids:
                 raise ValueError("decision id is not a conflict id")
-        # Apply the confirmed whole-item choices over the preview plan,
-        # building from deep copies so every passed object stays untouched.
-        incoming_by_id = {item["id"]: item for item in incoming_items}
-        current_by_id = {item["id"]: item for item in current_items}
-        resolved = [{"id": item_id, "choice": choice}
-                    for item_id, choice in choices.items()]
-        for item_id, choice in choices.items():
-            side = incoming_by_id if choice == "incoming" else current_by_id
-            merged[item_id] = copy.deepcopy(side.get(item_id))
+        # Apply the confirmed choices over the preview plan, building from
+        # detached values so every passed object stays untouched.
+        resolved = self._apply_merge_choices(merged, choices, incoming_items, current_items)
         items = self._ordered_merge_items(merged, incoming_items, current_items)
         self._validate_merge_items(items)
         if any(entry["id"] not in choices for entry in conflicts):
@@ -1677,6 +1707,29 @@ class ReleaseDesk:
                                   "current": dict(current_item) if current_item is not None else None})
                 merged[item_id] = current_item
         return merged, conflicts
+
+    @staticmethod
+    def _apply_merge_choices(merged, choices, incoming_items, current_items):
+        # Apply validated choices over the preview plan and return the
+        # resolved entries in decision order. A chosen side is adopted as one
+        # whole item and a side lacking the id deletes the item; a custom
+        # value replaces the item wholesale (never field by field) and a
+        # custom absent decision deletes it. Even a custom value equal to one
+        # of the sides, or a deletion of an item the current side already
+        # lacks, is recorded with choice "custom". Everything built here is
+        # detached from the passed objects.
+        incoming_by_id = {item["id"]: item for item in incoming_items}
+        current_by_id = {item["id"]: item for item in current_items}
+        resolved = []
+        for item_id, choice in choices.items():
+            if isinstance(choice, str):
+                side = incoming_by_id if choice == "incoming" else current_by_id
+                merged[item_id] = copy.deepcopy(side.get(item_id))
+                resolved.append({"id": item_id, "choice": choice})
+            else:
+                merged[item_id] = dict(choice["value"]) if choice["present"] else None
+                resolved.append({"id": item_id, "choice": "custom"})
+        return resolved
 
     @staticmethod
     def _ordered_merge_items(merged, incoming_items, current_items):

@@ -6920,6 +6920,177 @@ class ResolveMergeChecklistTests(unittest.TestCase):
         self.assertEqual([base, incoming, current, decisions], snapshot)
         self.assertEqual(self.path.read_bytes(), store_before)
 
+    def test_custom_value_replaces_item_wholesale(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": {"present": True, "value": {
+            "id": "x", "text": "Xray custom", "required": False, "status": "done"}}}
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertFalse(result["canMerge"])
+        self.assertEqual(result["items"][0],
+                         {"id": "x", "text": "Xray custom",
+                          "required": False, "status": "done"})
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"}])
+        self.assertEqual([entry["id"] for entry in result["conflicts"]], ["y"])
+
+    def test_custom_value_equal_to_a_side_still_counts_as_custom(self):
+        base, incoming, current = self.conflicting_inputs()
+        # The custom value is identical to the incoming side of x.
+        decisions = {"x": {"present": True, "value": {
+            "id": "x", "text": "Xray", "required": True, "status": "done"}}}
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"}])
+        self.assertEqual(result["items"][0],
+                         {"id": "x", "text": "Xray", "required": True, "status": "done"})
+
+    def test_custom_value_fields_are_trimmed_and_normalized(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": {"present": True, "value": {
+            "id": " x ", "text": "  Xray again  ", "required": True, "status": "done"}}}
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual(result["items"][0],
+                         {"id": "x", "text": "Xray again",
+                          "required": True, "status": "done"})
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"}])
+
+    def test_custom_absent_deletes_item(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": {"present": False}, "y": "incoming"}
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertTrue(result["canMerge"])
+        self.assertTrue(result["ready"])
+        self.assertEqual([item["id"] for item in result["items"]], ["z"])
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"},
+                                              {"id": "y", "choice": "incoming"}])
+        self.assertEqual(result["conflicts"], [])
+
+    def test_custom_absent_on_missing_current_side_still_counts(self):
+        # The current side lacks r; a custom deletion still resolves the
+        # conflict and is recorded as custom.
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, {"r": {"present": False}})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual([item["id"] for item in result["items"]], ["a"])
+        self.assertEqual(result["resolved"], [{"id": "r", "choice": "custom"}])
+
+    def test_custom_value_for_incoming_only_conflict_keeps_incoming_order(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+            {"id": "n", "text": "New", "required": False, "status": "pending"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "blocked"},
+            {"id": "n", "text": "New", "required": False, "status": "done"},
+        ])
+        # n conflicts (incoming pending vs current done); a custom value keeps
+        # its current-side position.
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current,
+            {"a": "incoming",
+             "n": {"present": True, "value": {"id": "n", "text": "Newer",
+                                              "required": True, "status": "done"}}})
+        self.assertTrue(result["canMerge"])
+        self.assertEqual([item["id"] for item in result["items"]], ["a", "n"])
+        self.assertEqual(result["items"][1],
+                         {"id": "n", "text": "Newer", "required": True, "status": "done"})
+        self.assertEqual(result["resolved"], [{"id": "a", "choice": "incoming"},
+                                              {"id": "n", "choice": "custom"}])
+
+    def test_custom_result_must_stay_a_legal_checklist(self):
+        # Deleting the only required item leaves a checklist without any
+        # required item, which is rejected.
+        base = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+            {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current, {"x": {"present": False}})
+        # Deleting the only item at all leaves an empty checklist: rejected.
+        base2 = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+        ])
+        incoming2 = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+        ])
+        current2 = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+        ])
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base2, incoming2, current2, {"x": {"present": False}})
+
+    def test_custom_decision_validation(self):
+        base, incoming, current = self.conflicting_inputs()
+        value = {"id": "x", "text": "Xray", "required": True, "status": "done"}
+        bad = [
+            {"x": {"present": 1, "value": value}},                # non-boolean present
+            {"x": {"present": "true", "value": value}},
+            {"x": {"present": None}},
+            {"x": {"present": True}},                             # missing value
+            {"x": {"present": True, "value": value, "note": 1}},  # extra field
+            {"x": {"present": False, "value": value}},            # value on delete
+            {"x": {"value": value}},                              # missing present
+            {"x": {"present": True, "value": "x"}},               # value not an object
+            {"x": {"present": True, "value": {"id": "x", "text": "T",
+                                             "required": True}}},  # missing status
+            {"x": {"present": True, "value": dict(value, note=1)}},  # extra value field
+            {"x": {"present": True, "value": dict(value, status="weird")}},
+            {"x": {"present": True, "value": dict(value, required=1)}},
+            {"x": {"present": True, "value": dict(value, text="  ")}},
+            {"x": {"present": True, "value": dict(value, text="a\nb")}},
+            {"x": {"present": True, "value": dict(value, id=" ")}},
+            {"x": {"present": True, "value": dict(value, id="y")}},   # id mismatch
+            {"x": {"present": True, "value": dict(value, id="X")}},   # case mismatch
+            {"x": {"present": True, "value": dict(value, id=" x  y")}},
+        ]
+        for decisions in bad:
+            with self.assertRaises(ValueError, msg=repr(decisions)):
+                self.desk.resolve_merge_checklist(
+                    "1.2.0", base, incoming, current, decisions)
+        # A custom decision at a non-conflict id is still rejected.
+        with self.assertRaises(ValueError):
+            self.desk.resolve_merge_checklist(
+                "1.2.0", base, incoming, current,
+                {"z": {"present": True, "value": dict(value, id="z")}})
+
+    def test_custom_decision_inputs_untouched_and_result_detached(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": {"present": True, "value": {
+            "id": "x", "text": "Xray custom", "required": True, "status": "done"}}}
+        snapshot = json.loads(json.dumps([base, incoming, current, decisions]))
+        result = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+        result["items"][0]["text"] = "mutated"
+        result["resolved"][0]["choice"] = "incoming"
+        self.assertEqual([base, incoming, current, decisions], snapshot)
+
     def command(self, *extra):
         return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
                 "resolve-merge-checklist", *extra]
@@ -6961,6 +7132,31 @@ class ResolveMergeChecklistTests(unittest.TestCase):
         self.assertEqual(empty_report["resolved"], [])
         self.assertEqual([entry["id"] for entry in empty_report["conflicts"]], ["x", "y"])
 
+    def test_cli_resolve_merge_checklist_custom_decisions(self):
+        base, incoming, current = self.conflicting_inputs()
+        decisions = {"x": {"present": True, "value": {
+                         "id": "x", "text": "Xray custom",
+                         "required": True, "status": "done"}},
+                     "y": {"present": False}}
+        paths = self.write_files(base, incoming, current, decisions)
+        before = [path.read_bytes() for path in paths] + [self.path.read_bytes()]
+        result = subprocess.run(
+            self.command("1.2.0", *map(str, paths)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["canMerge"])
+        self.assertTrue(report["ready"])
+        self.assertEqual([item["id"] for item in report["items"]], ["x", "z"])
+        self.assertEqual(report["items"][0],
+                         {"id": "x", "text": "Xray custom",
+                          "required": True, "status": "done"})
+        self.assertEqual(report["resolved"], [{"id": "x", "choice": "custom"},
+                                              {"id": "y", "choice": "custom"}])
+        self.assertEqual(report["conflicts"], [])
+        self.assertEqual([path.read_bytes() for path in paths] + [self.path.read_bytes()],
+                         before)
+
     def test_cli_resolve_merge_checklist_errors(self):
         base, incoming, current = self.conflicting_inputs()
         base_path, incoming_path, current_path, decisions_path = self.write_files(
@@ -6977,9 +7173,15 @@ class ResolveMergeChecklistTests(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(failed.returncode, 2, raw)
             self.assertEqual(set(json.loads(failed.stdout)), {"error"})
-        # Bad decision content: non-object, illegal choice, non-conflict id.
+        # Bad decision content: non-object, illegal choice, non-conflict id,
+        # malformed custom decision objects.
         for raw in ("[]", "null", json.dumps({"x": "target"}),
-                    json.dumps({"z": "incoming"}), json.dumps({"X": "incoming"})):
+                    json.dumps({"z": "incoming"}), json.dumps({"X": "incoming"}),
+                    json.dumps({"x": {"present": 1}}),
+                    json.dumps({"x": {"present": True}}),
+                    json.dumps({"x": {"present": False, "value": {}}}),
+                    json.dumps({"x": {"present": True, "value": {
+                        "id": "y", "text": "T", "required": True, "status": "done"}}})):
             decisions_path.write_text(raw, encoding="utf-8")
             failed = subprocess.run(
                 self.command("1.2.0", str(base_path), str(incoming_path),
@@ -7309,6 +7511,119 @@ class ApplyMergeChecklistTests(unittest.TestCase):
         written = json.loads(self.current.read_text(encoding="utf-8"))
         self.assertEqual(written["items"][0]["status"], "done")
 
+    def test_custom_decisions_save_and_report(self):
+        base, incoming, current = self.conflicting_inputs()
+        self.write_current(current)
+        decisions = {"x": {"present": True, "value": {
+                         "id": " x ", "text": " Xray custom ",
+                         "required": True, "status": "done"}},
+                     "y": {"present": False}}
+        result = self.apply(base, incoming, current, decisions)
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["items"], [
+            {"id": "x", "text": "Xray custom", "required": True, "status": "done"},
+            {"id": "z", "text": "Zed", "required": True, "status": "done"}])
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"},
+                                              {"id": "y", "choice": "custom"}])
+        # items and resolved match the corresponding confirmation result.
+        confirmed = self.desk.resolve_merge_checklist(
+            "1.2.0", base, incoming, current, decisions)
+        self.assertEqual(result["items"], confirmed["items"])
+        self.assertEqual(result["resolved"], confirmed["resolved"])
+        written = json.loads(self.current.read_text(encoding="utf-8"))
+        self.assertEqual(set(written), {"version", "items"})
+        self.assertEqual(written["items"], result["items"])
+
+    def test_custom_value_equal_to_current_keeps_bytes_and_mtime(self):
+        base, incoming, current = self.conflicting_inputs()
+        self.write_current(current)
+        before = self.current.read_bytes()
+        mtime = self.current.stat().st_mtime_ns
+        # Both custom values reproduce the current side exactly.
+        decisions = {"x": {"present": True, "value": {
+                         "id": "x", "text": "Xray", "required": True, "status": "blocked"}},
+                     "y": {"present": True, "value": {
+                         "id": "y", "text": "Yank", "required": False, "status": "done"}}}
+        result = self.apply(base, incoming, current, decisions)
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["resolved"], [{"id": "x", "choice": "custom"},
+                                              {"id": "y", "choice": "custom"}])
+        self.assertEqual(self.current.read_bytes(), before)
+        self.assertEqual(self.current.stat().st_mtime_ns, mtime)
+
+    def test_custom_delete_of_missing_current_item_keeps_bytes(self):
+        base = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "pending"},
+            {"id": "r", "text": "R", "required": True, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "a", "text": "Alpha", "required": True, "status": "done"},
+        ])
+        self.write_current(current)
+        before = self.current.read_bytes()
+        result = self.apply(base, incoming, current, {"r": {"present": False}})
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["resolved"], [{"id": "r", "choice": "custom"}])
+        self.assertEqual(self.current.read_bytes(), before)
+
+    def test_custom_not_ready_result_still_saves(self):
+        base, incoming, current = self.conflicting_inputs()
+        self.write_current(current)
+        decisions = {"x": {"present": True, "value": {
+                         "id": "x", "text": "Xray", "required": True, "status": "blocked"}},
+                     "y": "incoming"}
+        result = self.apply(base, incoming, current, decisions)
+        self.assertTrue(result["changed"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(json.loads(self.current.read_text(encoding="utf-8"))["items"],
+                         result["items"])
+
+    def test_custom_decision_errors_preserve_bytes(self):
+        base, incoming, current = self.conflicting_inputs()
+        self.write_current(current)
+        before = self.current.read_bytes()
+        value = {"id": "x", "text": "Xray", "required": True, "status": "done"}
+        bad = [
+            {"x": {"present": 1, "value": value}, "y": "incoming"},
+            {"x": {"present": True}, "y": "incoming"},
+            {"x": {"present": False, "value": value}, "y": "incoming"},
+            {"x": {"present": True, "value": dict(value, id="y")}, "y": "incoming"},
+            {"x": {"present": True, "value": dict(value, status="weird")},
+             "y": "incoming"},
+            {"z": {"present": False}, "x": "incoming", "y": "incoming"},
+        ]
+        for decisions in bad:
+            with self.assertRaises(ValueError, msg=repr(decisions)):
+                self.apply(base, incoming, current, decisions)
+        # A custom decision resolving only part of the conflicts refuses to write.
+        with self.assertRaises(ValueError):
+            self.apply(base, incoming, current, {"x": {"present": False}})
+        self.assertEqual(self.current.read_bytes(), before)
+
+    def test_custom_result_without_required_item_refuses_to_write(self):
+        base = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "pending"},
+            {"id": "y", "text": "Yank", "required": False, "status": "pending"},
+        ])
+        incoming = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "done"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        current = self.payload([
+            {"id": "x", "text": "Xray", "required": True, "status": "blocked"},
+            {"id": "y", "text": "Yank", "required": False, "status": "done"},
+        ])
+        self.write_current(current)
+        before = self.current.read_bytes()
+        with self.assertRaises(ValueError):
+            self.apply(base, incoming, current, {"x": {"present": False}})
+        self.assertEqual(self.current.read_bytes(), before)
+
     def command(self, *extra):
         return [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path),
                 "apply-merge-checklist", *extra]
@@ -7359,6 +7674,47 @@ class ApplyMergeChecklistTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(steady.returncode, 0, steady.stderr)
         self.assertFalse(json.loads(steady.stdout)["changed"])
+        self.assertEqual(self.current.read_bytes(), before)
+
+    def test_cli_apply_merge_checklist_custom_decisions(self):
+        base, incoming, current = self.conflicting_inputs()
+        files = self.write_files(base, incoming, current,
+                                 {"x": {"present": True, "value": {
+                                     "id": "x", "text": "Xray custom",
+                                     "required": True, "status": "done"}},
+                                  "y": {"present": False}})
+        self.write_current(current)
+        paths = [str(files[name]) for name in ("base", "incoming", "expected", "decisions")]
+        inputs_before = {name: path.read_bytes() for name, path in files.items()}
+        store_before = self.path.read_bytes()
+        result = subprocess.run(
+            self.command("1.2.0", *paths, str(self.current)),
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report), {"version", "changed", "items", "resolved", "ready"})
+        self.assertTrue(report["changed"])
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["items"], [
+            {"id": "x", "text": "Xray custom", "required": True, "status": "done"},
+            {"id": "z", "text": "Zed", "required": True, "status": "done"}])
+        self.assertEqual(report["resolved"], [{"id": "x", "choice": "custom"},
+                                              {"id": "y", "choice": "custom"}])
+        written = json.loads(self.current.read_text(encoding="utf-8"))
+        self.assertEqual(set(written), {"version", "items"})
+        self.assertEqual(written["items"], report["items"])
+        self.assertEqual({name: path.read_bytes() for name, path in files.items()},
+                         inputs_before)
+        self.assertEqual(self.path.read_bytes(), store_before)
+        # A malformed custom decision exits 2 and preserves the target bytes.
+        before = self.current.read_bytes()
+        files["decisions"].write_text(json.dumps({"x": {"present": 1}}), encoding="utf-8")
+        failed = subprocess.run(
+            self.command("1.2.0", *paths, str(self.current)),
+            capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(set(json.loads(failed.stdout)), {"error"})
         self.assertEqual(self.current.read_bytes(), before)
 
     def test_cli_apply_merge_checklist_errors(self):
