@@ -736,6 +736,67 @@ class ReleaseDesk:
         selected = self._applicable_template_items(items, records[version])
         return {"version": version, "items": selected}
 
+    def generate_checklist_with_dependencies(self, version, payload, dependencies):
+        # Read-only dependency-aware checklist generation: the template is
+        # filtered by the release's change categories exactly like
+        # generate_checklist, then every direct and indirect prerequisite of
+        # the selected items is added even when its own categories do not
+        # apply. The whole dependency graph is validated against the whole
+        # template first, so edges of template items the filter would drop
+        # still have to be legal and acyclic. Nothing is written and the
+        # passed objects are never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_template(payload)
+        # Every id in the dependency map, at either end, must reference a
+        # template item: the complete map and the complete template are
+        # validated, including items the category filter never selects.
+        prerequisites = self._validated_dependencies(
+            dependencies, {item["id"] for item in items})
+        # The whole store is validated before the version is looked up.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(items, records[version])
+        selected_ids = {item["id"] for item in selected}
+        # Close over every direct and indirect prerequisite of the selected
+        # items; shared prerequisites are collected once. Only the member set
+        # matters here: the final order always follows the template.
+        closure = set(selected_ids)
+        pending = list(selected_ids)
+        while pending:
+            node = pending.pop()
+            for prerequisite in prerequisites.get(node, ()):
+                if prerequisite not in closure:
+                    closure.add(prerequisite)
+                    pending.append(prerequisite)
+        selected_by_id = {item["id"]: item for item in selected}
+        # Final items keep template order: initially selected items stay in
+        # their positions and prerequisites added solely for the closure slot
+        # in at their template positions, even when their categories do not
+        # apply. The selected dicts already carry the uniform pending item
+        # shape; added prerequisites are rendered from their template entry.
+        result_items, dependency_pairs = [], []
+        for item in items:
+            item_id = item["id"]
+            if item_id not in closure:
+                continue
+            if item_id in selected_ids:
+                result_items.append(dict(selected_by_id[item_id]))
+            else:
+                result_items.append({"id": item_id, "text": item["text"],
+                                     "required": item["required"], "status": "pending"})
+            # Every final id gets a normalized array in template order;
+            # omitted items and declared empty arrays both freeze to [].
+            dependency_pairs.append((item_id, list(prerequisites.get(item_id, ()))))
+        # includedPrerequisites lists, in template order, only the items
+        # added solely because of a dependency edge.
+        included_prerequisites = [item["id"] for item in items
+                                  if item["id"] in closure and item["id"] not in selected_ids]
+        return {"version": version, "items": result_items,
+                "dependencies": dict(dependency_pairs),
+                "includedPrerequisites": included_prerequisites}
+
     def audit_checklist(self, version, checklist, template):
         # Read-only audit of a declared checklist against the template items
         # applicable to the same release; status is never inferred from texts.
@@ -1721,6 +1782,7 @@ def main():
     make_checklist = commands.add_parser("make-checklist")
     make_checklist.add_argument("version")
     make_checklist.add_argument("file")
+    make_checklist.add_argument("--dependencies")
     audit = commands.add_parser("audit-checklist")
     audit.add_argument("version")
     audit.add_argument("checklist")
@@ -1898,7 +1960,17 @@ def main():
                     payload = _loads_unique(Path(args.file).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
-                result = desk.generate_checklist(args.version, payload)
+                if args.dependencies is None:
+                    result = desk.generate_checklist(args.version, payload)
+                else:
+                    try:
+                        dependencies_payload = _loads_unique(
+                            Path(args.dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "dependencies file must contain UTF-8 encoded JSON") from exc
+                    result = desk.generate_checklist_with_dependencies(
+                        args.version, payload, dependencies_payload)
             elif args.command == "audit-checklist":
                 try:
                     checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))

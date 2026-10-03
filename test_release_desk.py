@@ -1964,6 +1964,239 @@ class GenerateChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class GenerateChecklistWithDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Retry empty exports"}])
+
+    def template(self):
+        return {"items": [
+            {"id": "docs", "text": " Write notes ", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            {"id": "changed", "text": "Note a change", "required": False, "categories": ["Changed"]},
+        ]}
+
+    def generate(self, dependencies, template=None, version="1.2.0"):
+        return self.desk.generate_checklist_with_dependencies(
+            version, template or self.template(), dependencies)
+
+    def test_empty_dependencies_matches_plain_generation(self):
+        result = self.generate({})
+        self.assertEqual(set(result), {"version", "items", "dependencies", "includedPrerequisites"})
+        plain = self.desk.generate_checklist("1.2.0", self.template())
+        self.assertEqual(result["version"], "1.2.0")
+        self.assertEqual(result["items"], plain["items"])
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"},
+        ])
+        self.assertEqual(result["dependencies"], {"docs": [], "fixed": []})
+        self.assertEqual(result["includedPrerequisites"], [])
+
+    def test_inapplicable_prerequisites_are_added_in_template_order(self):
+        result = self.generate({"fixed": ["added", "changed"]})
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["docs", "fixed", "added", "changed"])
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+            {"id": "changed", "text": "Note a change", "required": False, "status": "pending"},
+        ])
+        self.assertEqual(result["dependencies"], {
+            "docs": [], "fixed": ["added", "changed"], "added": [], "changed": []})
+        self.assertEqual(result["includedPrerequisites"], ["added", "changed"])
+
+    def test_transitive_closure_adds_shared_prerequisite_once(self):
+        # docs and fixed are both selected; both reach "added", which in turn
+        # reaches "changed". Each added id appears once, in template order.
+        result = self.generate({"fixed": ["added"], "added": ["changed"], "docs": ["added"]})
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["docs", "fixed", "added", "changed"])
+        self.assertEqual(result["includedPrerequisites"], ["added", "changed"])
+        self.assertEqual(result["dependencies"], {
+            "docs": ["added"], "fixed": ["added"], "added": ["changed"], "changed": []})
+
+    def test_unrelated_items_stay_excluded_even_with_edges(self):
+        # Only selected/final ids appear in the dependency map: an inapplicable
+        # item pointing at a selected one is neither added nor listed.
+        result = self.generate({"changed": ["fixed"]})
+        self.assertEqual([item["id"] for item in result["items"]], ["docs", "fixed"])
+        self.assertEqual(result["dependencies"], {"docs": [], "fixed": []})
+        self.assertEqual(result["includedPrerequisites"], [])
+
+    def test_result_feeds_check_dependencies(self):
+        result = self.generate({"fixed": ["added", "changed"], "added": ["changed"]})
+        report = self.desk.check_dependencies("1.2.0", result, result["dependencies"])
+        self.assertFalse(report["ready"])
+        effects = {item["id"]: item["effectiveStatus"] for item in report["items"]}
+        self.assertEqual(effects, {"docs": "pending", "fixed": "blocked",
+                                   "added": "blocked", "changed": "pending"})
+        self.assertEqual(report["items"][1]["waiting"], ["added", "changed"])
+
+    def test_ids_normalized_and_array_order_kept(self):
+        result = self.generate({" fixed ": ["  changed  ", "  added  "]})
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["docs", "fixed", "added", "changed"])
+        self.assertEqual(result["dependencies"]["fixed"], ["changed", "added"])
+        self.assertEqual(result["includedPrerequisites"], ["added", "changed"])
+
+    def test_invalid_dependencies_structure(self):
+        for dependencies in (None, [], "x", 1, {"docs": "fixed"}, {"added": None}):
+            with self.assertRaises(ValueError):
+                self.generate(dependencies)
+
+    def test_full_graph_validated_including_unselected_items(self):
+        # An unknown key on an item the filter would not select is rejected.
+        with self.assertRaises(ValueError):
+            self.generate({"added": ["ghost"]})
+        with self.assertRaises(ValueError):
+            self.generate({"ghost": ["docs"]})
+        # A cycle over inapplicable items is rejected.
+        with self.assertRaises(ValueError):
+            self.generate({"added": ["changed"], "changed": ["added"]})
+        # Self dependency, normalized duplicate keys, duplicate prerequisites.
+        with self.assertRaises(ValueError):
+            self.generate({"docs": ["docs"]})
+        with self.assertRaises(ValueError):
+            self.generate({"docs": [], " docs ": []})
+        with self.assertRaises(ValueError):
+            self.generate({"fixed": ["added", " added "]})
+        for bad_id in (None, 1, "  ", "a\nb", "a\rb"):
+            with self.assertRaises(ValueError):
+                self.generate({"docs": [bad_id]})
+            with self.assertRaises(ValueError):
+                self.generate({bad_id: []})
+
+    def test_invalid_template_version_store(self):
+        for version in (None, 1, "v1", "1.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.generate({}, version=version)
+        with self.assertRaises(ValueError):
+            self.generate({}, version="9.9.9")
+        with self.assertRaises(ValueError):
+            self.generate({}, template={"items": []})
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.generate_checklist_with_dependencies("1.2.0", self.template(), {})
+        self.assertFalse(missing.path.parent.exists())
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.generate({})
+
+    def test_empty_selection_and_no_required_still_rejected(self):
+        # Empty initial selection stays an error even with dependencies.
+        only_added = {"items": [
+            {"id": "a", "text": "A", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.generate({}, template=only_added)
+        # An initial selection without required items is rejected even when a
+        # transitive prerequisite happens to be required in the template.
+        rescue = {"items": [
+            {"id": "a", "text": "A", "required": False},
+            {"id": "b", "text": "B", "required": False, "categories": ["Added"]},
+            {"id": "c", "text": "C", "required": True, "categories": ["Changed"]},
+        ]}
+        with self.assertRaises(ValueError):
+            self.generate({"a": ["b"], "b": ["c"]}, template=rescue)
+
+    def test_readonly_and_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        template, dependencies = self.template(), {"fixed": ["added"]}
+        template_snapshot = json.loads(json.dumps(template))
+        deps_snapshot = json.loads(json.dumps(dependencies))
+        result = self.generate(dependencies, template)
+        result["items"][0]["text"] = "mutated"
+        result["items"].append({"id": "x"})
+        result["dependencies"]["fixed"].append("docs")
+        result["dependencies"]["new"] = ["x"]
+        result["includedPrerequisites"].append("fixed")
+        self.assertEqual(template, template_snapshot)
+        self.assertEqual(dependencies, deps_snapshot)
+        again = self.generate(dependencies, template)
+        self.assertEqual([item["id"] for item in again["items"]], ["docs", "fixed", "added"])
+        self.assertEqual(again["dependencies"]["fixed"], ["added"])
+        self.assertEqual(again["includedPrerequisites"], ["added"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_with_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        template = Path(self.temp.name) / "template.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        dependencies.write_text(json.dumps({"fixed": ["added", "changed"]}), encoding="utf-8")
+        result = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template),
+                                          "--dependencies", str(dependencies)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(list(parsed), ["version", "items", "dependencies", "includedPrerequisites"])
+        self.assertEqual([item["id"] for item in parsed["items"]],
+                         ["docs", "fixed", "added", "changed"])
+        self.assertEqual(parsed["includedPrerequisites"], ["added", "changed"])
+        # The generated checklist plus the frozen map goes straight to check.
+        generated = Path(self.temp.name) / "generated.json"
+        generated.write_text(json.dumps({"version": parsed["version"], "items": parsed["items"]}),
+                             encoding="utf-8")
+        frozen = Path(self.temp.name) / "frozen.json"
+        frozen.write_text(json.dumps(parsed["dependencies"]), encoding="utf-8")
+        checked = subprocess.run(prefix + ["check-dependencies", "1.2.0",
+                                           str(generated), str(frozen)],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertFalse(json.loads(checked.stdout)["ready"])
+
+    def test_cli_without_option_keeps_original_shape(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        template = Path(self.temp.name) / "template.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        result = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(json.loads(result.stdout)), ["version", "items"])
+
+    def test_cli_dependency_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        template = Path(self.temp.name) / "template.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            "[]",
+            json.dumps({"added": ["ghost"]}),
+            json.dumps({"added": ["changed"], "changed": ["added"]}),
+            json.dumps({"docs": ["docs"]}),
+            '{"docs": [], " docs ": []}',
+            '{"docs": [], "docs": []}',
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                dependencies.write_bytes(case)
+            else:
+                dependencies.write_text(case, encoding="utf-8")
+            result = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template),
+                                              "--dependencies", str(dependencies)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        absent = subprocess.run(prefix + ["make-checklist", "1.2.0", str(template),
+                                          "--dependencies", str(Path(self.temp.name) / "nope.json")],
+                                capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse((Path(self.temp.name) / "nope.json").exists())
+
+
 class AuditChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
