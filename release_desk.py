@@ -1089,6 +1089,120 @@ class ReleaseDesk:
         return {"version": version, "items": reconciled,
                 "retained": retained, "reset": reset, "added": added, "removed": removed}
 
+    def reconcile_checklist_with_dependencies(self, version, checklist, template,
+                                              base_dependencies, dependencies):
+        # Read-only dependency-aware update of a same-version checklist
+        # against a revised template: the final scope is the applicable
+        # template items closed over every direct and indirect prerequisite,
+        # exactly like generate_checklist_with_dependencies, and old progress
+        # is kept only when the item definition and its direct prerequisite
+        # id set are unchanged and no added or reset item is reachable along
+        # the new graph. The old graph is validated against the whole old
+        # checklist and the new graph against the whole new template, items
+        # the category filter would drop included. Nothing is written and the
+        # passed objects are never mutated.
+        if not isinstance(version, str) or not re.fullmatch(VERSION_PATTERN, version):
+            raise ValueError("version must have three nonnegative numeric components")
+        items = self._validated_checklist(checklist, version)
+        template_items = self._validated_template(template)
+        # Both graphs follow the existing dependency validation in full: the
+        # old one against every old checklist item, the new one against every
+        # template item, selected or not.
+        base_prerequisites = self._validated_dependencies(
+            base_dependencies, {item["id"] for item in items})
+        prerequisites = self._validated_dependencies(
+            dependencies, {item["id"] for item in template_items})
+        # The whole store is validated before the version is looked up; a
+        # missing store is treated as empty and then reports it as unknown.
+        records = self._read_store()
+        if version not in records:
+            raise ValueError("unknown release")
+        selected = self._applicable_template_items(template_items, records[version])
+        selected_ids = {item["id"] for item in selected}
+        # Close over every direct and indirect prerequisite of the selected
+        # items; shared prerequisites are collected once. Only the member set
+        # matters here: the final order always follows the template.
+        closure = set(selected_ids)
+        pending = list(selected_ids)
+        while pending:
+            node = pending.pop()
+            for prerequisite in prerequisites.get(node, ()):
+                if prerequisite not in closure:
+                    closure.add(prerequisite)
+                    pending.append(prerequisite)
+        # Ids match case-sensitively after trimming, without Unicode normalization.
+        previous = {item["id"]: item for item in items}
+        # First pass over the final scope in template order: new items are
+        # added; an old item whose normalized text, required or direct
+        # prerequisite id set changed is reset. Prerequisite sets compare
+        # order-free and a missing key equals an empty array.
+        classification = {}
+        for item in template_items:
+            item_id = item["id"]
+            if item_id not in closure:
+                continue
+            actual = previous.get(item_id)
+            if actual is None:
+                classification[item_id] = "added"
+            elif (actual["text"] != item["text"] or actual["required"] != item["required"]
+                  or set(base_prerequisites.get(item_id, ()))
+                  != set(prerequisites.get(item_id, ()))):
+                classification[item_id] = "reset"
+            else:
+                classification[item_id] = "retained"
+        # Second pass: an old item that reaches an added or reset item along
+        # the new graph is reset as well and returns to pending. Reachability
+        # is transitive, so one search per retained candidate settles it; an
+        # existing prerequisite merely being pending or blocked never resets.
+        changed = {item_id for item_id, kind in classification.items() if kind != "retained"}
+
+        def reaches_changed(node):
+            seen = set()
+            stack = list(prerequisites.get(node, ()))
+            while stack:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                if current in changed:
+                    return True
+                stack.extend(prerequisites.get(current, ()))
+            return False
+
+        for item_id, kind in classification.items():
+            if kind == "retained" and reaches_changed(item_id):
+                classification[item_id] = "reset"
+        reconciled, retained, reset, added = [], [], [], []
+        dependency_pairs = []
+        for item in template_items:
+            item_id = item["id"]
+            if item_id not in closure:
+                continue
+            kind = classification[item_id]
+            if kind == "retained":
+                reconciled.append({"id": item_id, "text": item["text"],
+                                   "required": item["required"],
+                                   "status": previous[item_id]["status"]})
+                retained.append(item_id)
+            else:
+                # Added and reset items take the new definition as pending.
+                reconciled.append({"id": item_id, "text": item["text"],
+                                   "required": item["required"], "status": "pending"})
+                (added if kind == "added" else reset).append(item_id)
+            # Every final id gets a normalized array in template order; omitted
+            # items and declared empty arrays both freeze to [].
+            dependency_pairs.append((item_id, list(prerequisites.get(item_id, ()))))
+        removed = [item["id"] for item in items if item["id"] not in closure]
+        # includedPrerequisites lists, in template order, only the items
+        # added solely because of a dependency edge.
+        included_prerequisites = [item["id"] for item in template_items
+                                  if item["id"] in closure and item["id"] not in selected_ids]
+        return {"version": version, "items": reconciled,
+                "retained": retained, "reset": reset, "added": added,
+                "removed": removed,
+                "dependencies": dict(dependency_pairs),
+                "includedPrerequisites": included_prerequisites}
+
     def migrate_checklist(self, base_version, target_version, checklist, template):
         # Read-only cross-version migration: only progress still backed by the
         # target release is inherited. Unlike reconcile_checklist, a same-id
@@ -1926,6 +2040,8 @@ def main():
     reconcile.add_argument("version")
     reconcile.add_argument("checklist")
     reconcile.add_argument("template")
+    reconcile.add_argument("--base-dependencies", dest="base_dependencies")
+    reconcile.add_argument("--dependencies")
     migrate = commands.add_parser("migrate-checklist")
     migrate.add_argument("base_version")
     migrate.add_argument("target_version")
@@ -2171,7 +2287,28 @@ def main():
                     template_payload = _loads_unique(Path(args.template).read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise ValueError("template file must contain UTF-8 encoded JSON") from exc
-                result = desk.reconcile_checklist(args.version, checklist_payload, template_payload)
+                if args.base_dependencies is None and args.dependencies is None:
+                    result = desk.reconcile_checklist(
+                        args.version, checklist_payload, template_payload)
+                else:
+                    if args.base_dependencies is None or args.dependencies is None:
+                        raise ValueError(
+                            "reconcile-checklist requires --base-dependencies and --dependencies together")
+                    try:
+                        base_dependencies_payload = _loads_unique(
+                            Path(args.base_dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "base dependencies file must contain UTF-8 encoded JSON") from exc
+                    try:
+                        dependencies_payload = _loads_unique(
+                            Path(args.dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "dependencies file must contain UTF-8 encoded JSON") from exc
+                    result = desk.reconcile_checklist_with_dependencies(
+                        args.version, checklist_payload, template_payload,
+                        base_dependencies_payload, dependencies_payload)
             elif args.command == "migrate-checklist":
                 try:
                     checklist_payload = _loads_unique(Path(args.checklist).read_text(encoding="utf-8"))

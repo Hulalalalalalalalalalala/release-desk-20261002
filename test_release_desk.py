@@ -3126,6 +3126,378 @@ class ReconcileChecklistTests(unittest.TestCase):
         self.assertFalse(store.parent.exists())
 
 
+class ReconcileChecklistWithDependenciesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "releases.json"
+        self.desk = ReleaseDesk(self.path)
+        self.desk.add("1.2.0", [{"category": "Fixed", "text": "Retry empty exports"}])
+
+    def template(self):
+        return {"items": [
+            {"id": "docs", "text": " Write notes ", "required": True},
+            {"id": "fixed", "text": "Verify fix", "required": True, "categories": ["Fixed"]},
+            {"id": "added", "text": "Announce feature", "required": False, "categories": ["Added"]},
+            {"id": "changed", "text": "Note a change", "required": False, "categories": ["Changed"]},
+        ]}
+
+    def checklist(self):
+        return {"version": "1.2.0", "items": [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "blocked"},
+        ]}
+
+    _MISSING = object()
+
+    def reconcile(self, base_dependencies=_MISSING, dependencies=_MISSING,
+                  checklist=None, template=None, version="1.2.0"):
+        return self.desk.reconcile_checklist_with_dependencies(
+            version,
+            self.checklist() if checklist is None else checklist,
+            self.template() if template is None else template,
+            {} if base_dependencies is self._MISSING else base_dependencies,
+            {} if dependencies is self._MISSING else dependencies)
+
+    def test_empty_graphs_match_plain_reconcile(self):
+        result = self.reconcile()
+        self.assertEqual(set(result), {"version", "items", "retained", "reset",
+                                       "added", "removed", "dependencies",
+                                       "includedPrerequisites"})
+        plain = self.desk.reconcile_checklist("1.2.0", self.checklist(), self.template())
+        for field in ("version", "items", "retained", "reset", "added", "removed"):
+            self.assertEqual(result[field], plain[field])
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual(result["dependencies"], {"docs": [], "fixed": []})
+        self.assertEqual(result["includedPrerequisites"], [])
+
+    def test_closure_adds_prerequisites_and_set_change_resets(self):
+        # fixed gains prerequisites it never had: the set change resets it,
+        # and the inapplicable prerequisites enter as added in template order.
+        result = self.reconcile(dependencies={"fixed": ["added", "changed"]})
+        self.assertEqual([item["id"] for item in result["items"]],
+                         ["docs", "fixed", "added", "changed"])
+        self.assertEqual(result["items"], [
+            {"id": "docs", "text": "Write notes", "required": True, "status": "done"},
+            {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"},
+            {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+            {"id": "changed", "text": "Note a change", "required": False, "status": "pending"},
+        ])
+        self.assertEqual(result["retained"], ["docs"])
+        self.assertEqual(result["reset"], ["fixed"])
+        self.assertEqual(result["added"], ["added", "changed"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["dependencies"], {
+            "docs": [], "fixed": ["added", "changed"], "added": [], "changed": []})
+        self.assertEqual(result["includedPrerequisites"], ["added", "changed"])
+
+    def test_prerequisite_set_ignores_order_and_missing_keys(self):
+        checklist = self.checklist()
+        checklist["items"].extend([
+            {"id": "added", "text": "Announce feature", "required": False, "status": "done"},
+            {"id": "changed", "text": "Note a change", "required": False, "status": "pending"},
+        ])
+        # Same set in another order, plus an explicit empty array for a key
+        # the old graph omits: nothing resets.
+        result = self.reconcile(
+            base_dependencies={"fixed": ["added", "changed"]},
+            dependencies={"fixed": ["changed", "added"], "docs": []},
+            checklist=checklist)
+        self.assertEqual(result["retained"], ["docs", "fixed", "added", "changed"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["done", "blocked", "done", "pending"])
+        self.assertEqual(result["dependencies"]["fixed"], ["changed", "added"])
+
+    def test_text_or_required_change_still_resets(self):
+        template = self.template()
+        template["items"][0]["text"] = "Write release notes"
+        result = self.reconcile(template=template)
+        self.assertEqual(result["reset"], ["docs"])
+        self.assertEqual(result["items"][0],
+                         {"id": "docs", "text": "Write release notes",
+                          "required": True, "status": "pending"})
+        self.assertEqual(result["retained"], ["fixed"])
+
+    def test_reaching_added_or_reset_resets_transitively(self):
+        # docs keeps its own definition and prerequisite set, but along the
+        # new graph it reaches fixed (reset by a set change) and added
+        # (added), so it resets too; added itself is a new item.
+        result = self.reconcile(
+            base_dependencies={"docs": ["fixed"]},
+            dependencies={"docs": ["fixed"], "fixed": ["added"]})
+        self.assertEqual(result["retained"], [])
+        self.assertEqual(result["reset"], ["docs", "fixed"])
+        self.assertEqual(result["added"], ["added"])
+        self.assertEqual([item["status"] for item in result["items"]],
+                         ["pending", "pending", "pending"])
+        self.assertEqual(result["includedPrerequisites"], ["added"])
+        self.assertEqual(result["dependencies"],
+                         {"docs": ["fixed"], "fixed": ["added"], "added": []})
+
+    def test_unfinished_prerequisite_alone_never_resets(self):
+        # An existing prerequisite merely being pending or blocked does not
+        # reset the item that depends on it.
+        checklist = self.checklist()
+        checklist["items"][1]["status"] = "pending"
+        result = self.reconcile(
+            base_dependencies={"docs": ["fixed"]},
+            dependencies={"docs": ["fixed"]},
+            checklist=checklist)
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual(result["reset"], [])
+        self.assertEqual([item["status"] for item in result["items"]], ["done", "pending"])
+
+    def test_removed_items_follow_old_checklist_order(self):
+        checklist = self.checklist()
+        checklist["items"].insert(0, {"id": "legacy", "text": "Legacy",
+                                      "required": False, "status": "done"})
+        checklist["items"].append({"id": "gone", "text": "Gone",
+                                   "required": False, "status": "blocked"})
+        result = self.reconcile(checklist=checklist)
+        self.assertEqual(result["removed"], ["legacy", "gone"])
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+        self.assertEqual(result["dependencies"], {"docs": [], "fixed": []})
+
+    def test_template_status_ignored(self):
+        template = self.template()
+        for item in template["items"]:
+            item["status"] = "done"
+        result = self.reconcile(template=template)
+        self.assertEqual([item["status"] for item in result["items"]], ["done", "blocked"])
+        self.assertEqual(result["retained"], ["docs", "fixed"])
+
+    def test_result_feeds_check_dependencies(self):
+        result = self.reconcile(dependencies={"fixed": ["added"]})
+        report = self.desk.check_dependencies("1.2.0", result, result["dependencies"])
+        self.assertFalse(report["ready"])
+        effects = {item["id"]: item["effectiveStatus"] for item in report["items"]}
+        self.assertEqual(effects, {"docs": "done", "fixed": "blocked", "added": "pending"})
+
+    def test_invalid_version_unknown_release_and_mismatch(self):
+        for version in (None, 1, "v1", "1.0", "1.0.0.0", "01.0.0"):
+            with self.assertRaises(ValueError):
+                self.reconcile(version=version)
+        for version in ("9.9.9", "1.0.0"):
+            with self.assertRaises(ValueError):
+                self.reconcile(version=version)
+        missing = ReleaseDesk(Path(self.temp.name) / "no-dir" / "releases.json")
+        with self.assertRaises(ValueError):
+            missing.reconcile_checklist_with_dependencies(
+                "1.2.0", self.checklist(), self.template(), {}, {})
+        self.assertFalse(missing.path.parent.exists())
+        with self.assertRaises(ValueError):
+            self.reconcile(checklist=self.checklist() | {"version": "1.3.0"})
+
+    def test_invalid_checklist_template_and_filter_failures(self):
+        with self.assertRaises(ValueError):
+            self.reconcile(checklist={"version": "1.2.0", "items": []})
+        with self.assertRaises(ValueError):
+            self.reconcile(template={"items": []})
+        only_added = {"items": [
+            {"id": "a", "text": "A", "required": True, "categories": ["Added"]}]}
+        with self.assertRaises(ValueError):
+            self.reconcile(template=only_added)
+        no_required = {"items": [
+            {"id": "docs", "text": "Write notes", "required": False},
+            {"id": "fixed", "text": "Verify fix", "required": False, "categories": ["Fixed"]}]}
+        with self.assertRaises(ValueError):
+            self.reconcile(template=no_required)
+
+    def test_both_graphs_validated_against_their_own_item_sets(self):
+        # The old graph must reference old checklist items only, even ones the
+        # new template also declares; the new graph must reference template
+        # items only, even ones the old checklist also declares.
+        with self.assertRaises(ValueError):
+            self.reconcile(base_dependencies={"docs": ["added"]})
+        with self.assertRaises(ValueError):
+            self.reconcile(base_dependencies={"added": []})
+        checklist = self.checklist()
+        checklist["items"].append({"id": "legacy", "text": "Legacy",
+                                   "required": False, "status": "done"})
+        with self.assertRaises(ValueError):
+            self.reconcile(dependencies={"legacy": []}, checklist=checklist)
+        with self.assertRaises(ValueError):
+            self.reconcile(dependencies={"docs": ["legacy"]}, checklist=checklist)
+        for bad in (None, [], "x", 1, {"docs": "fixed"}, {"docs": None}):
+            with self.assertRaises(ValueError):
+                self.reconcile(base_dependencies=bad)
+            with self.assertRaises(ValueError):
+                self.reconcile(dependencies=bad)
+        # Self dependencies, cycles and normalized duplicates in either graph,
+        # including a cycle over items no filter selects.
+        with self.assertRaises(ValueError):
+            self.reconcile(base_dependencies={"docs": ["docs"]})
+        with self.assertRaises(ValueError):
+            self.reconcile(dependencies={"docs": ["docs"]})
+        with self.assertRaises(ValueError):
+            self.reconcile(base_dependencies={"docs": ["fixed"], "fixed": ["docs"]})
+        with self.assertRaises(ValueError):
+            self.reconcile(dependencies={"added": ["changed"], "changed": ["added"]})
+        with self.assertRaises(ValueError):
+            self.reconcile(base_dependencies={"docs": [], " docs ": []})
+        with self.assertRaises(ValueError):
+            self.reconcile(dependencies={"fixed": ["added", " added "]})
+
+    def test_whole_store_validated(self):
+        raw = b'{"1.2.0": [{"category": "Fixed", "text": "One"}], "9.9.9": []}'
+        self.path.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.reconcile()
+        self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_readonly_and_detached(self):
+        before, mtime = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        checklist, template = self.checklist(), self.template()
+        base_dependencies = {"docs": ["fixed"]}
+        dependencies = {"docs": ["fixed"], "fixed": ["added"]}
+        snapshot = json.loads(json.dumps(
+            {"checklist": checklist, "template": template,
+             "base": base_dependencies, "deps": dependencies}))
+        result = self.desk.reconcile_checklist_with_dependencies(
+            "1.2.0", checklist, template, base_dependencies, dependencies)
+        self.assertEqual(result["reset"], ["docs", "fixed"])
+        result["items"][0]["text"] = "mutated"
+        result["items"].append({"id": "x"})
+        result["dependencies"]["docs"].append("added")
+        result["dependencies"]["new"] = ["x"]
+        result["includedPrerequisites"].append("docs")
+        result["reset"].append("added")
+        self.assertEqual({"checklist": checklist, "template": template,
+                          "base": base_dependencies, "deps": dependencies}, snapshot)
+        again = self.desk.reconcile_checklist_with_dependencies(
+            "1.2.0", checklist, template, base_dependencies, dependencies)
+        self.assertEqual(again["dependencies"], {"docs": ["fixed"], "fixed": ["added"], "added": []})
+        self.assertEqual(again["includedPrerequisites"], ["added"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_cli_reconcile_checklist_with_dependencies(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        base_dependencies = Path(self.temp.name) / "base-dependencies.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        base_dependencies.write_text(json.dumps({"docs": ["fixed"]}), encoding="utf-8")
+        dependencies.write_text(json.dumps({"docs": ["fixed"], "fixed": ["added"]}),
+                                encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template),
+                      "--base-dependencies", str(base_dependencies),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("\n"), 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload, {
+            "version": "1.2.0",
+            "items": [
+                {"id": "docs", "text": "Write notes", "required": True, "status": "pending"},
+                {"id": "fixed", "text": "Verify fix", "required": True, "status": "pending"},
+                {"id": "added", "text": "Announce feature", "required": False, "status": "pending"},
+            ],
+            "retained": [],
+            "reset": ["docs", "fixed"],
+            "added": ["added"],
+            "removed": [],
+            "dependencies": {"docs": ["fixed"], "fixed": ["added"], "added": []},
+            "includedPrerequisites": ["added"],
+        })
+        # The reconciled checklist plus the frozen map goes straight to check.
+        updated = Path(self.temp.name) / "updated.json"
+        updated.write_text(json.dumps({"version": payload["version"], "items": payload["items"]}),
+                           encoding="utf-8")
+        frozen = Path(self.temp.name) / "frozen.json"
+        frozen.write_text(json.dumps(payload["dependencies"]), encoding="utf-8")
+        checked = subprocess.run(prefix + ["check-dependencies", "1.2.0", str(updated), str(frozen)],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertFalse(json.loads(checked.stdout)["ready"])
+
+    def test_cli_without_options_keeps_original_shape(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        result = subprocess.run(prefix + ["reconcile-checklist", "1.2.0",
+                                          str(checklist), str(template)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(json.loads(result.stdout)),
+                         ["version", "items", "retained", "reset", "added", "removed"])
+
+    def test_cli_single_dependency_option_rejected(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        for extra in (["--dependencies", str(dependencies)],
+                      ["--base-dependencies", str(dependencies)]):
+            result = subprocess.run(prefix + ["reconcile-checklist", "1.2.0",
+                                              str(checklist), str(template)] + extra,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertEqual(result.stdout.count("\n"), 1)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+
+    def test_cli_dependency_file_errors(self):
+        prefix = [sys.executable, str(ROOT / "release_desk.py"), "--store", str(self.path)]
+        before = self.path.read_bytes()
+        checklist = Path(self.temp.name) / "checklist.json"
+        template = Path(self.temp.name) / "template.json"
+        base_dependencies = Path(self.temp.name) / "base-dependencies.json"
+        dependencies = Path(self.temp.name) / "dependencies.json"
+        checklist.write_text(json.dumps(self.checklist()), encoding="utf-8")
+        template.write_text(json.dumps(self.template()), encoding="utf-8")
+        base_dependencies.write_text("{}", encoding="utf-8")
+        cases = [
+            "{not json",
+            b"\xff\xfe",
+            "[]",
+            json.dumps({"docs": ["ghost"]}),
+            json.dumps({"added": ["changed"], "changed": ["added"]}),
+            '{"docs": [], "docs": []}',
+        ]
+        for case in cases:
+            if isinstance(case, bytes):
+                dependencies.write_bytes(case)
+            else:
+                dependencies.write_text(case, encoding="utf-8")
+            result = subprocess.run(
+                prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template),
+                          "--base-dependencies", str(base_dependencies),
+                          "--dependencies", str(dependencies)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, case)
+            self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        # A malformed base graph fails the same way.
+        base_dependencies.write_text('{"docs": [], " docs ": []}', encoding="utf-8")
+        dependencies.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template),
+                      "--base-dependencies", str(base_dependencies),
+                      "--dependencies", str(dependencies)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(set(json.loads(result.stdout)), {"error"})
+        absent = subprocess.run(
+            prefix + ["reconcile-checklist", "1.2.0", str(checklist), str(template),
+                      "--base-dependencies", str(base_dependencies),
+                      "--dependencies", str(Path(self.temp.name) / "nope.json")],
+            capture_output=True, text=True)
+        self.assertEqual(absent.returncode, 2)
+        self.assertIn("error", json.loads(absent.stdout))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse((Path(self.temp.name) / "nope.json").exists())
+
+
 class MigrateChecklistTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT)
