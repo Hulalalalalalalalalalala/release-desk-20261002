@@ -500,6 +500,14 @@ class ReleaseDesk:
         records = self._read_store()
         if version not in records:
             raise ValueError("unknown release")
+        return self._dependency_status_report(version, items, prerequisites)
+
+    @staticmethod
+    def _dependency_status_report(version, items, prerequisites):
+        # The check_dependencies report over normalized checklist items and an
+        # already-validated dependency map: declared statuses are kept and a
+        # blocked effective status is layered on top from direct prerequisites
+        # that are not themselves effectively done.
         status_by_id = {item["id"]: item["status"] for item in items}
         effective = {}
 
@@ -1464,14 +1472,23 @@ class ReleaseDesk:
                 "dependencies": dict(dependency_pairs),
                 "includedPrerequisites": included_prerequisites}
 
-    def update_checklist(self, version, updates, checklist_path):
+    def update_checklist(self, version, updates, checklist_path, dependencies=None):
         # Batch-update the statuses of a local checklist file after confirming
         # every expected status still matches the read bytes: one mismatch
         # rejects the whole batch. Only when at least one status changes is the
         # target replaced wholesale with UTF-8 JSON ending in a newline;
-        # otherwise its bytes and modification time are left untouched.
+        # otherwise its bytes and modification time are left untouched. An
+        # optional dependency map adds a post-batch prerequisite check: any
+        # batch entry targeting done whose direct prerequisites are not all
+        # effectively done in the candidate state rejects the whole batch.
         normalized_updates, items, path = self._prepare_checklist_update(
             version, updates, checklist_path)
+        prerequisites = None
+        if dependencies is not None:
+            # The whole graph is validated against the whole checklist,
+            # unrelated optional items included, before the expected checks.
+            prerequisites = self._validated_dependencies(
+                dependencies, {item["id"] for item in items})
         status_by_id = {item["id"]: item["status"] for item in items}
         # Ids match case-sensitively after trimming, without Unicode
         # normalization; every expected status is checked, including entries
@@ -1483,22 +1500,38 @@ class ReleaseDesk:
             if actual != expected:
                 raise ValueError("update expected status does not match the checklist")
         updated, resulting = self._apply_checklist_updates(items, normalized_updates)
+        if prerequisites is not None and self._dependency_update_conflicts(
+                normalized_updates, resulting, prerequisites):
+            raise ValueError("update leaves a done item waiting on unfinished prerequisites")
         changed = bool(updated)
         if changed:
             content = json.dumps({"version": version, "items": resulting},
                                  ensure_ascii=False, indent=2) + "\n"
             _atomic_write(path, content)
-        ready = all(item["status"] == "done" for item in resulting if item["required"])
+        if prerequisites is None:
+            ready = all(item["status"] == "done" for item in resulting if item["required"])
+            return {"version": version, "changed": changed, "items": resulting,
+                    "updated": updated, "ready": ready}
+        dependency_check = self._dependency_status_report(version, resulting, prerequisites)
         return {"version": version, "changed": changed, "items": resulting,
-                "updated": updated, "ready": ready}
+                "updated": updated, "ready": dependency_check["ready"],
+                "dependencyCheck": dependency_check}
 
-    def preview_update_checklist(self, version, updates, checklist_path):
+    def preview_update_checklist(self, version, updates, checklist_path, dependencies=None):
         # Read-only plan for update_checklist: the same public validation,
         # store and checklist checks and the same id matching, but unknown ids
         # and expected-status mismatches are reported as conflicts in updates
-        # order instead of raised, and nothing is ever written.
+        # order instead of raised, and nothing is ever written. An optional
+        # dependency map adds a dependencyConflicts report over the post-batch
+        # candidate state plus a complete dependencyCheck over the result.
         normalized_updates, items, _path = self._prepare_checklist_update(
             version, updates, checklist_path)
+        prerequisites = None
+        if dependencies is not None:
+            # The whole graph is validated against the whole checklist,
+            # unrelated optional items included, before the expected checks.
+            prerequisites = self._validated_dependencies(
+                dependencies, {item["id"] for item in items})
         status_by_id = {item["id"]: item["status"] for item in items}
         # Every expected status is checked, including entries whose target
         # status is already satisfied; conflicts keep the updates-array order.
@@ -1511,21 +1544,75 @@ class ReleaseDesk:
             elif actual != expected:
                 conflicts.append({"id": item_id, "expected": expected, "actual": actual,
                                   "status": target, "reason": "status-mismatch"})
+        dependency_conflicts = []
         if conflicts:
             # A conflicting batch plans nothing: the normalized original
-            # checklist is reported without any partial status changes.
+            # checklist is reported without any partial status changes, and
+            # no dependency conflicts are derived from it.
             can_update = False
             resulting = [dict(item) for item in items]
             updated = []
             changed = False
         else:
-            can_update = True
-            updated, resulting = self._apply_checklist_updates(items, normalized_updates)
-            changed = bool(updated)
-        ready = all(item["status"] == "done" for item in resulting if item["required"])
+            updated, candidate = self._apply_checklist_updates(items, normalized_updates)
+            if prerequisites is not None:
+                dependency_conflicts = self._dependency_update_conflicts(
+                    normalized_updates, candidate, prerequisites)
+            if dependency_conflicts:
+                # A dependency-conflicting batch plans nothing either.
+                can_update = False
+                resulting = [dict(item) for item in items]
+                updated = []
+                changed = False
+            else:
+                can_update = True
+                resulting = candidate
+                changed = bool(updated)
+        if prerequisites is None:
+            ready = all(item["status"] == "done" for item in resulting if item["required"])
+            return {"version": version, "canUpdate": can_update, "changed": changed,
+                    "items": resulting, "updated": updated, "ready": ready,
+                    "conflicts": conflicts}
+        dependency_check = self._dependency_status_report(version, resulting, prerequisites)
         return {"version": version, "canUpdate": can_update, "changed": changed,
-                "items": resulting, "updated": updated, "ready": ready,
-                "conflicts": conflicts}
+                "items": resulting, "updated": updated,
+                "ready": dependency_check["ready"], "conflicts": conflicts,
+                "dependencyConflicts": dependency_conflicts,
+                "dependencyCheck": dependency_check}
+
+    @staticmethod
+    def _dependency_update_conflicts(normalized_updates, candidate_items, prerequisites):
+        # Dependency conflicts of an update batch against the post-batch
+        # candidate checklist: every batch entry whose target status is done —
+        # including entries already done — requires every direct prerequisite
+        # effectively done in the candidate state. Prerequisites completed by
+        # the same batch count, batch order never affects the outcome, and
+        # items the batch does not touch never trigger a conflict by
+        # themselves. Entries follow the updates order and hold only the id
+        # and the waiting direct prerequisites in dependency-array order.
+        status_by_id = {item["id"]: item["status"] for item in candidate_items}
+        effective = {}
+
+        def effective_status(item_id):
+            # The same memoized effective-status rule as check_dependencies,
+            # computed over the candidate statuses.
+            if item_id not in effective:
+                status = status_by_id[item_id]
+                if any(effective_status(prerequisite) != "done"
+                       for prerequisite in prerequisites.get(item_id, ())):
+                    status = "blocked"
+                effective[item_id] = status
+            return effective[item_id]
+
+        conflicts = []
+        for item_id, _expected, target in normalized_updates:
+            if target != "done":
+                continue
+            waiting = [prerequisite for prerequisite in prerequisites.get(item_id, ())
+                       if effective_status(prerequisite) != "done"]
+            if waiting:
+                conflicts.append({"id": item_id, "waiting": waiting})
+        return conflicts
 
     def preview_merge_checklist(self, version, base, incoming, current):
         # Read-only three-way merge preview of same-version checklists: items
@@ -2264,6 +2351,7 @@ def main():
     update_checklist.add_argument("updates")
     update_checklist.add_argument("checklist")
     update_checklist.add_argument("--dry-run", action="store_true", dest="dry_run")
+    update_checklist.add_argument("--dependencies")
     merge_checklist = commands.add_parser("merge-checklist")
     merge_checklist.add_argument("version")
     merge_checklist.add_argument("base")
@@ -2561,12 +2649,23 @@ def main():
                 if _same_file(Path(args.updates), checklist_path):
                     raise ValueError(
                         "checklist file must not be the same file as the updates file")
+                dependencies_payload = None
+                if args.dependencies is not None:
+                    try:
+                        dependencies_payload = _loads_unique(
+                            Path(args.dependencies).read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            "dependencies file must contain UTF-8 encoded JSON") from exc
+                    if _same_file(Path(args.dependencies), checklist_path):
+                        raise ValueError(
+                            "checklist file must not be the same file as the dependencies file")
                 if args.dry_run:
                     result = desk.preview_update_checklist(
-                        args.version, updates_payload, checklist_path)
+                        args.version, updates_payload, checklist_path, dependencies_payload)
                 else:
                     result = desk.update_checklist(
-                        args.version, updates_payload, checklist_path)
+                        args.version, updates_payload, checklist_path, dependencies_payload)
             elif args.command == "merge-checklist":
                 try:
                     base_payload = _loads_unique(Path(args.base).read_text(encoding="utf-8"))
